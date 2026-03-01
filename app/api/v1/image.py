@@ -168,17 +168,33 @@ def _normalize_size_and_aspect(*, size: Optional[str], aspect_ratio: Optional[st
 def _extract_aspect_ratio_from_prompt(prompt: str) -> Optional[str]:
     """Extract allowed aspect ratio from prompt text via regex.
 
-    Supports patterns like: 9:16, 9：16, 16:9, etc.
+    Supports patterns like:
+    - 9:16, 9：16, 9∶16
+    - 9/16
+    - 9x16, 9X16, 9×16
     """
     if not prompt:
         return None
 
-    normalized = str(prompt).replace("：", ":")
-    match = re.search(r"(?<!\d)(1\s*:\s*1|2\s*:\s*3|3\s*:\s*2|9\s*:\s*16|16\s*:\s*9)(?!\d)", normalized)
+    normalized = str(prompt)
+    # normalize common separators
+    normalized = (
+        normalized.replace("：", ":")
+        .replace("∶", ":")  # U+2236 ratio sign
+        .replace("／", "/")  # full-width slash
+    )
+
+    # NOTE: keep the regex strict (only known aspect ratios) but accept several separators.
+    sep = r"[:/xX×]"
+    pattern = rf"(?<!\d)(1\s*{sep}\s*1|2\s*{sep}\s*3|3\s*{sep}\s*2|9\s*{sep}\s*16|16\s*{sep}\s*9)(?!\d)"
+
+    match = re.search(pattern, normalized)
     if not match:
         return None
 
     token = re.sub(r"\s+", "", match.group(1))
+    token = re.sub(sep, ":", token)
+
     if _is_aspect_ratio(token):
         return resolve_aspect_ratio(token)
     return None
@@ -245,7 +261,9 @@ def _validate_common_request(
     # resolution 作为 size 的别名同样校验
     if getattr(request, "resolution", None):
         resolution_val = str(getattr(request, "resolution")).strip()
-        if resolution_val not in ALLOWED_IMAGE_SIZES and not _is_aspect_ratio(resolution_val):
+        if resolution_val not in ALLOWED_IMAGE_SIZES and not _is_aspect_ratio(
+            resolution_val
+        ):
             raise ValidationException(
                 message=(
                     f"resolution must be one of {sorted(ALLOWED_IMAGE_SIZES)} "
@@ -503,6 +521,50 @@ async def edit_image(request: Request):
     # ------------------------------------------------------------------
     form = await request.form()
 
+    # ------------------------------------------------------------------
+    # 1.1 打印请求内容（用于排查 prompt 中比例提取失败等问题）
+    # ------------------------------------------------------------------
+    try:
+        # Avoid leaking secrets (api keys, auth headers)
+        sensitive_headers = {"authorization", "x-api-key"}
+        safe_headers = {
+            k: v for k, v in request.headers.items() if k.lower() not in sensitive_headers
+        }
+        logger.info(
+            "[/v1/images/edits] incoming request: content-type=%r headers=%s",
+            request.headers.get("content-type"),
+            safe_headers,
+        )
+    except Exception:
+        logger.exception("[/v1/images/edits] failed to log request headers")
+
+    # Summarize multipart fields (do NOT read file bytes here)
+    try:
+        field_summaries = []
+        for k, v in form.multi_items():
+            if _is_upload_file(v):
+                field_summaries.append(
+                    {
+                        "key": k,
+                        "type": "file",
+                        "filename": getattr(v, "filename", None),
+                        "content_type": getattr(v, "content_type", None),
+                    }
+                )
+            else:
+                sv = str(v)
+                field_summaries.append(
+                    {
+                        "key": k,
+                        "type": "text",
+                        "value": (sv[:500] + "...<truncated>") if len(sv) > 500 else sv,
+                        "len": len(sv),
+                    }
+                )
+        logger.info("[/v1/images/edits] multipart fields=%s", field_summaries)
+    except Exception:
+        logger.exception("[/v1/images/edits] failed to summarize multipart fields")
+
     # 提取文本字段（带默认值）
     prompt = form.get("prompt")
     if not prompt or not str(prompt).strip():
@@ -520,7 +582,11 @@ async def edit_image(request: Request):
     resolution_raw = form.get("resolution")
     effective_size_raw = size_raw if size_raw is not None else resolution_raw
     has_size_field = effective_size_raw is not None
-    size = str(effective_size_raw).strip() if effective_size_raw is not None else "1024x1024"
+    size = (
+        str(effective_size_raw).strip()
+        if effective_size_raw is not None
+        else "1024x1024"
+    )
 
     # Compatibility: accept aspect_ratio/aspectRatio in multipart
     aspect_ratio_raw = form.get("aspect_ratio")
@@ -540,6 +606,21 @@ async def edit_image(request: Request):
         stream_str = str(stream_raw).lower()
         stream = stream_str in ("true", "1", "yes")
 
+    logger.info(
+        "[/v1/images/edits] parsed fields: model=%r n=%r size_raw=%r resolution_raw=%r "
+        "has_size_field=%r aspect_ratio_raw=%r response_format=%r stream_raw=%r",
+        model,
+        n,
+        size_raw,
+        resolution_raw,
+        has_size_field,
+        aspect_ratio_raw,
+        response_format_val,
+        stream_raw,
+    )
+    # Use repr to expose invisible characters in prompt
+    logger.info("[/v1/images/edits] prompt(repr)=%r", prompt)
+
     # ------------------------------------------------------------------
     # 提取上传的图片文件 —— 兼容多种字段名
     # ------------------------------------------------------------------
@@ -557,7 +638,17 @@ async def edit_image(request: Request):
                         f"type={type(v).__name__}"
                     )
 
-    logger.info(f"Collected {len(uploaded_files)} uploaded image(s)")
+    logger.info(
+        "[/v1/images/edits] collected %d uploaded image(s): %s",
+        len(uploaded_files),
+        [
+            {
+                "filename": getattr(f, "filename", None),
+                "content_type": getattr(f, "content_type", None),
+            }
+            for f in uploaded_files
+        ],
+    )
 
     # ------------------------------------------------------------------
     # 2. 构建 Pydantic 请求对象进行校验
@@ -645,6 +736,13 @@ async def edit_image(request: Request):
                     code="invalid_image_type",
                 )
 
+        logger.info(
+            "[/v1/images/edits] read upload: filename=%r content_type=%r bytes=%d",
+            item.filename,
+            item.content_type,
+            len(content),
+        )
+
         b64 = base64.b64encode(content).decode()
         images.append(f"data:{mime};base64,{b64}")
 
@@ -655,8 +753,18 @@ async def edit_image(request: Request):
     normalize_aspect_input = edit_request.aspect_ratio
 
     # 允许通过 prompt 指定比例；当存在 prompt 比例时，优先按比例生成。
+    extracted_from_prompt = None
     if not normalize_aspect_input:
-        normalize_aspect_input = _extract_aspect_ratio_from_prompt(edit_request.prompt)
+        extracted_from_prompt = _extract_aspect_ratio_from_prompt(edit_request.prompt)
+        normalize_aspect_input = extracted_from_prompt
+
+    logger.info(
+        "[/v1/images/edits] aspect normalization: explicit_aspect=%r extracted_from_prompt=%r "
+        "normalize_size_input=%r",
+        edit_request.aspect_ratio,
+        extracted_from_prompt,
+        normalize_size_input,
+    )
 
     # If aspect is known (explicit or extracted), do not let a stale/default size lock ratio to 1:1.
     if normalize_aspect_input:
@@ -670,6 +778,12 @@ async def edit_image(request: Request):
             size=normalize_size_input,
             aspect_ratio=normalize_aspect_input,
         )
+
+    logger.info(
+        "[/v1/images/edits] normalized: size=%r aspect_ratio=%r",
+        normalized_size,
+        aspect_ratio,
+    )
 
     # ------------------------------------------------------------------
     # 5. 调用编辑服务
