@@ -30,20 +30,6 @@ def _normalize_chat_proxy(proxy_url: str) -> str:
     return proxy_url
 
 
-def _extract_aspect_ratio_from_payload(payload: Dict[str, Any]) -> Optional[str]:
-    """Extract image edit aspect ratio from app-chat payload if present."""
-    try:
-        return (
-            payload.get("responseMetadata", {})
-            .get("modelConfigOverride", {})
-            .get("modelMap", {})
-            .get("imageEditModelConfig", {})
-            .get("aspectRatio")
-        )
-    except Exception:
-        return None
-
-
 class AppChatReverse:
     """/rest/app-chat/conversations/new reverse interface."""
 
@@ -163,23 +149,6 @@ class AppChatReverse:
                 tool_overrides=tool_overrides,
                 model_config_override=model_config_override,
             )
-
-            payload_aspect_ratio = _extract_aspect_ratio_from_payload(payload)
-            logger.info(
-                f"[aspect-ratio-trace] app_chat.request model={model} mode={mode} has_model_config_override={bool(model_config_override)} payload_aspect_ratio={payload_aspect_ratio} attachments={len(file_attachments or [])}"
-            )
-            if model_config_override:
-                try:
-                    compact = orjson.dumps(model_config_override).decode()
-                    if len(compact) > 2000:
-                        compact = compact[:2000] + "...<truncated>"
-                    logger.info(
-                        f"[aspect-ratio-trace] app_chat.model_config_override={compact}"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"[aspect-ratio-trace] app_chat.model_config_override serialize_failed error={e}"
-                    )
 
             # Curl Config
             timeout = float(get_config("chat.timeout") or 0)
