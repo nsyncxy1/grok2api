@@ -443,6 +443,9 @@ async def edit_image(request: Request):
     # 参数验证
     validate_edit_request(edit_request, uploaded_files)
 
+    # Resolve aspect ratio from size for image edits
+    aspect_ratio = resolve_aspect_ratio(edit_request.size)
+
     # ------------------------------------------------------------------
     # 3. 读取并验证图片内容
     # ------------------------------------------------------------------
@@ -500,6 +503,7 @@ async def edit_image(request: Request):
         n=edit_request.n,
         response_format=response_format,
         stream=bool(edit_request.stream),
+        aspect_ratio=aspect_ratio,
     )
 
     if result.stream:
