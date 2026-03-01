@@ -4,6 +4,7 @@ Image Generation API 路由
 
 import base64
 import time
+import logging
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -18,6 +19,7 @@ from app.services.token import get_token_manager
 from app.core.exceptions import ValidationException, AppException, ErrorType
 from app.core.config import get_config
 
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Images"])
 
@@ -338,6 +340,28 @@ async def edit_image(request: Request):
     # ------------------------------------------------------------------
     form = await request.form()
 
+    # ====== DEBUG: 打印 form 中所有字段信息 ======
+    logger.warning("===== [DEBUG] /images/edits form fields =====")
+    for key in form:
+        raw_values = form.getlist(key)
+        for idx, v in enumerate(raw_values):
+            if isinstance(v, UploadFile):
+                logger.warning(
+                    f"  field={key!r} [{idx}] => UploadFile("
+                    f"filename={v.filename!r}, "
+                    f"content_type={v.content_type!r}, "
+                    f"size={v.size})"
+                )
+            else:
+                # 截断过长的值
+                val_str = str(v)
+                if len(val_str) > 200:
+                    val_str = val_str[:200] + "...(truncated)"
+                logger.warning(
+                    f"  field={key!r} [{idx}] => type={type(v).__name__}, value={val_str!r}"
+                )
+    logger.warning("===== [DEBUG] end of form fields =====")
+
     # 提取文本字段（带默认值）
     prompt = form.get("prompt")
     if not prompt or not str(prompt).strip():
@@ -363,14 +387,18 @@ async def edit_image(request: Request):
         stream_str = str(stream_raw).lower()
         stream = stream_str in ("true", "1", "yes")
 
-    # 提取上传的图片文件 —— 兼容 'image' 和 'image[]' 两种字段名
+    # 提取上传的图片文件 —— 兼容多种字段名
     uploaded_files: List[UploadFile] = []
     for key in form:
         if key in _IMAGE_FIELD_NAMES:
             values = form.getlist(key)
+            logger.warning(f"[DEBUG] Matching field={key!r}, getlist returned {len(values)} items")
             for v in values:
+                logger.warning(f"[DEBUG]   item type={type(v).__name__}, is UploadFile={isinstance(v, UploadFile)}")
                 if isinstance(v, UploadFile):
                     uploaded_files.append(v)
+
+    logger.warning(f"[DEBUG] Total uploaded_files collected: {len(uploaded_files)}")
 
     # ------------------------------------------------------------------
     # 2. 构建 Pydantic 请求对象进行校验
