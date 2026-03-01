@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import List, Optional, Union
 
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
@@ -245,6 +245,14 @@ async def _get_token(model: str):
     return token_mgr, token
 
 
+# ---------------------------------------------------------------------------
+# Accepted multipart field names for image uploads.
+# Many clients (OpenAI SDK, curl, etc.) send multiple files as "image[]"
+# instead of repeating "image".  We accept both.
+# ---------------------------------------------------------------------------
+_IMAGE_FIELD_NAMES = {"image", "image[]"}
+
+
 @router.post("/images/generations")
 async def create_image(request: ImageGenerationRequest):
     """
@@ -316,24 +324,59 @@ async def create_image(request: ImageGenerationRequest):
 
 
 @router.post("/images/edits")
-async def edit_image(
-    prompt: str = Form(...),
-    image: List[UploadFile] = File(...),
-    model: Optional[str] = Form("grok-imagine-1.0-edit"),
-    n: int = Form(1),
-    size: str = Form("1024x1024"),
-    quality: str = Form("standard"),
-    response_format: Optional[str] = Form(None),
-    style: Optional[str] = Form(None),
-    stream: Optional[bool] = Form(False),
-):
+async def edit_image(request: Request):
     """
     Image Edits API
 
-    同官方 API 格式，仅支持 multipart/form-data 文件上传
+    同官方 API 格式，仅支持 multipart/form-data 文件上传。
+    兼容 'image' 和 'image[]' 两种字段名，支持单图和多图上传。
     """
-    if response_format is None:
-        response_format = resolve_response_format(None)
+    # ------------------------------------------------------------------
+    # 1. 手动解析 multipart form data
+    #    FastAPI 的 File(...) 只认固定字段名，无法同时兼容 image / image[]，
+    #    所以改用 request.form() 手动提取。
+    # ------------------------------------------------------------------
+    form = await request.form()
+
+    # 提取文本字段（带默认值）
+    prompt = form.get("prompt")
+    if not prompt or not str(prompt).strip():
+        raise ValidationException(
+            message="Prompt is required",
+            param="prompt",
+            code="missing_prompt",
+        )
+    prompt = str(prompt).strip()
+
+    model = str(form.get("model", "grok-imagine-1.0-edit"))
+    n = int(form.get("n", 1))
+    size = str(form.get("size", "1024x1024"))
+    quality = str(form.get("quality", "standard"))
+    response_format_raw = form.get("response_format")
+    response_format_val = str(response_format_raw) if response_format_raw else None
+    style_raw = form.get("style")
+    style = str(style_raw) if style_raw else None
+    stream_raw = form.get("stream")
+    if stream_raw is None:
+        stream = False
+    else:
+        stream_str = str(stream_raw).lower()
+        stream = stream_str in ("true", "1", "yes")
+
+    # 提取上传的图片文件 —— 兼容 'image' 和 'image[]' 两种字段名
+    uploaded_files: List[UploadFile] = []
+    for key in form:
+        if key in _IMAGE_FIELD_NAMES:
+            values = form.getlist(key)
+            for v in values:
+                if isinstance(v, UploadFile):
+                    uploaded_files.append(v)
+
+    # ------------------------------------------------------------------
+    # 2. 构建 Pydantic 请求对象进行校验
+    # ------------------------------------------------------------------
+    if response_format_val is None:
+        response_format_val = resolve_response_format(None)
 
     try:
         edit_request = ImageEditRequest(
@@ -342,7 +385,7 @@ async def edit_image(
             n=n,
             size=size,
             quality=quality,
-            response_format=response_format,
+            response_format=response_format_val,
             style=style,
             stream=stream,
         )
@@ -370,13 +413,16 @@ async def edit_image(
     response_field = response_field_name(response_format)
 
     # 参数验证
-    validate_edit_request(edit_request, image)
+    validate_edit_request(edit_request, uploaded_files)
 
+    # ------------------------------------------------------------------
+    # 3. 读取并验证图片内容
+    # ------------------------------------------------------------------
     max_image_bytes = 50 * 1024 * 1024
     allowed_types = {"image/png", "image/jpeg", "image/webp", "image/jpg"}
 
     images: List[str] = []
-    for item in image:
+    for item in uploaded_files:
         content = await item.read()
         await item.close()
         if not content:
@@ -411,7 +457,9 @@ async def edit_image(
         b64 = base64.b64encode(content).decode()
         images.append(f"data:{mime};base64,{b64}")
 
-    # 获取 token 和模型信息
+    # ------------------------------------------------------------------
+    # 4. 调用编辑服务
+    # ------------------------------------------------------------------
     token_mgr, token = await _get_token(edit_request.model)
     model_info = ModelService.get(edit_request.model)
 
