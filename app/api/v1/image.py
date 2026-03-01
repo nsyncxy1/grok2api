@@ -394,10 +394,26 @@ async def create_image(request: ImageGenerationRequest):
     response_format = resolve_response_format(request.response_format)
     response_field = response_field_name(response_format)
 
+    logger.info(
+        "[aspect-ratio-trace] image_gen.request model=%s size=%s aspect_ratio=%s n=%s stream=%s",
+        request.model,
+        request.size,
+        request.aspect_ratio,
+        request.n,
+        request.stream,
+    )
+
     # Normalize size/aspect ratio (compat: accept aspectRatio and ratio-like size)
     normalized_size, aspect_ratio = _normalize_size_and_aspect(
         size=request.size,
         aspect_ratio=request.aspect_ratio,
+    )
+
+    logger.info(
+        "[aspect-ratio-trace] image_gen.normalized model=%s normalized_size=%s normalized_aspect_ratio=%s",
+        request.model,
+        normalized_size,
+        aspect_ratio,
     )
 
     # 获取 token 和模型信息
@@ -476,6 +492,15 @@ async def edit_image(request: Request):
     if aspect_ratio_raw is None:
         aspect_ratio_raw = form.get("aspectRatio")
     aspect_ratio_val = str(aspect_ratio_raw).strip() if aspect_ratio_raw else None
+
+    logger.info(
+        "[aspect-ratio-trace] image_edit.form model=%s raw_size=%s raw_aspect_ratio=%s raw_aspectRatio=%s n=%s",
+        model,
+        size,
+        form.get("aspect_ratio"),
+        form.get("aspectRatio"),
+        n,
+    )
 
     quality = str(form.get("quality", "standard"))
     response_format_raw = form.get("response_format")
@@ -556,6 +581,15 @@ async def edit_image(request: Request):
     normalized_size, aspect_ratio = _normalize_size_and_aspect(
         size=edit_request.size,
         aspect_ratio=edit_request.aspect_ratio,
+    )
+
+    logger.info(
+        "[aspect-ratio-trace] image_edit.normalized model=%s normalized_size=%s normalized_aspect_ratio=%s request_size=%s request_aspect_ratio=%s",
+        edit_request.model,
+        normalized_size,
+        aspect_ratio,
+        edit_request.size,
+        edit_request.aspect_ratio,
     )
 
     # ------------------------------------------------------------------

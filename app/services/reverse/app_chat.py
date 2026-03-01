@@ -30,6 +30,20 @@ def _normalize_chat_proxy(proxy_url: str) -> str:
     return proxy_url
 
 
+def _extract_aspect_ratio_from_payload(payload: Dict[str, Any]) -> Optional[str]:
+    """Extract image edit aspect ratio from app-chat payload if present."""
+    try:
+        return (
+            payload.get("responseMetadata", {})
+            .get("modelConfigOverride", {})
+            .get("modelMap", {})
+            .get("imageEditModelConfig", {})
+            .get("aspectRatio")
+        )
+    except Exception:
+        return None
+
+
 class AppChatReverse:
     """/rest/app-chat/conversations/new reverse interface."""
 
@@ -148,6 +162,16 @@ class AppChatReverse:
                 file_attachments=file_attachments,
                 tool_overrides=tool_overrides,
                 model_config_override=model_config_override,
+            )
+
+            payload_aspect_ratio = _extract_aspect_ratio_from_payload(payload)
+            logger.info(
+                "[aspect-ratio-trace] app_chat.request model=%s mode=%s has_model_config_override=%s payload_aspect_ratio=%s attachments=%s",
+                model,
+                mode,
+                bool(model_config_override),
+                payload_aspect_ratio,
+                len(file_attachments or []),
             )
 
             # Curl Config
