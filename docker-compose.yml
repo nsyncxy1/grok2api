@@ -1,84 +1,23 @@
 services:
   grok2api:
     container_name: grok2api
-    image: grok2api:local
-    build:
-      context: .
-      dockerfile_inline: |
-        FROM python:3.13-alpine AS builder
-
-        ENV PYTHONDONTWRITEBYTECODE=1 \
-            PYTHONUNBUFFERED=1 \
-            TZ=Asia/Shanghai \
-            UV_PROJECT_ENVIRONMENT=/opt/venv
-
-        ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
-
-        RUN apk add --no-cache \
-            tzdata \
-            ca-certificates \
-            build-base \
-            linux-headers \
-            libffi-dev \
-            openssl-dev \
-            curl-dev \
-            cargo \
-            rust
-
-        WORKDIR /app
-
-        COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-
-        COPY pyproject.toml uv.lock ./
-
-        RUN uv sync --frozen --no-dev --no-install-project \
-            && find /opt/venv -type d -name "__pycache__" -prune -exec rm -rf {} + \
-            && find /opt/venv -type f -name "*.pyc" -delete \
-            && find /opt/venv -type d -name "tests" -prune -exec rm -rf {} + \
-            && find /opt/venv -type d -name "test" -prune -exec rm -rf {} + \
-            && find /opt/venv -type d -name "testing" -prune -exec rm -rf {} + \
-            && find /opt/venv -type f -name "*.so" -exec strip --strip-unneeded {} + || true \
-            && rm -rf /root/.cache /tmp/uv-cache
-
-        FROM python:3.13-alpine
-
-        ENV PYTHONDONTWRITEBYTECODE=1 \
-            PYTHONUNBUFFERED=1 \
-            TZ=Asia/Shanghai \
-            VIRTUAL_ENV=/opt/venv
-
-        ENV PATH="$VIRTUAL_ENV/bin:$PATH"
-
-        RUN apk add --no-cache \
-            tzdata \
-            ca-certificates \
-            libffi \
-            openssl \
-            libgcc \
-            libstdc++ \
-            libcurl
-
-        WORKDIR /app
-
-        COPY --from=builder /opt/venv /opt/venv
-
-        COPY config.defaults.toml ./
-        COPY app ./app
-        COPY main.py ./
-        COPY scripts ./scripts
-
-        RUN mkdir -p /app/data /app/logs \
-            && chmod +x /app/scripts/entrypoint.sh
-
-        EXPOSE 8000
-
-        ENTRYPOINT ["/app/scripts/entrypoint.sh"]
-
-        CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    image: python:3.13-alpine
+    working_dir: /app
+    command: >
+      sh -c "
+        apk add --no-cache tzdata ca-certificates libffi openssl libgcc libstdc++ libcurl curl-dev build-base linux-headers libffi-dev openssl-dev cargo rust &&
+        cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime &&
+        /app/scripts/init_storage.sh &&
+        pip install uv --quiet &&
+        uv sync --frozen --no-dev --no-install-project &&
+        uv run uvicorn main:app --host 0.0.0.0 --port 8000
+      "
     ports:
       - "30015:8000"
     environment:
       TZ: Asia/Shanghai
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
       LOG_LEVEL: INFO
       SERVER_PORT: 8000
       SERVER_WORKERS: 1
@@ -91,6 +30,11 @@ services:
       #   MySQL: mysql+aiomysql://user:pass@localhost/db
       #   PgSQL: postgresql+asyncpg://user:pass@localhost/db
     volumes:
+      - .:/app
       - ./data:/app/data
       - ./logs:/app/logs
+      - uv-cache:/root/.cache/uv
     restart: unless-stopped
+
+volumes:
+  uv-cache:
