@@ -3,6 +3,7 @@ Image Generation API 路由
 """
 
 import base64
+import re
 import time
 from pathlib import Path
 from typing import List, Optional, Union
@@ -164,6 +165,25 @@ def _normalize_size_and_aspect(*, size: Optional[str], aspect_ratio: Optional[st
     return size_val, ar
 
 
+def _extract_aspect_ratio_from_prompt(prompt: str) -> Optional[str]:
+    """Extract allowed aspect ratio from prompt text via regex.
+
+    Supports patterns like: 9:16, 9：16, 16:9, etc.
+    """
+    if not prompt:
+        return None
+
+    normalized = str(prompt).replace("：", ":")
+    match = re.search(r"(?<!\d)(1\s*:\s*1|2\s*:\s*3|3\s*:\s*2|9\s*:\s*16|16\s*:\s*9)(?!\d)", normalized)
+    if not match:
+        return None
+
+    token = re.sub(r"\s+", "", match.group(1))
+    if _is_aspect_ratio(token):
+        return resolve_aspect_ratio(token)
+    return None
+
+
 def _validate_common_request(
     request: Union[ImageGenerationRequest, ImageEditRequest],
     *,
@@ -310,88 +330,6 @@ def resolve_aspect_ratio(size: str) -> str:
     return "2:3"
 
 
-def _detect_image_dimensions(content: bytes, mime: str) -> tuple[Optional[int], Optional[int]]:
-    """Best-effort parse image dimensions without extra deps (png/jpeg/webp)."""
-    try:
-        # PNG
-        if content.startswith(b"\x89PNG\r\n\x1a\n") and len(content) >= 24:
-            w = int.from_bytes(content[16:20], "big")
-            h = int.from_bytes(content[20:24], "big")
-            if w > 0 and h > 0:
-                return w, h
-
-        # JPEG
-        if content.startswith(b"\xff\xd8"):
-            i = 2
-            end = len(content)
-            while i + 9 < end:
-                if content[i] != 0xFF:
-                    i += 1
-                    continue
-                marker = content[i + 1]
-                i += 2
-                # standalone markers
-                if marker in (0xD8, 0xD9):
-                    continue
-                if i + 1 >= end:
-                    break
-                seg_len = int.from_bytes(content[i:i + 2], "big")
-                if seg_len < 2 or i + seg_len > end:
-                    break
-                # SOF markers
-                if marker in {
-                    0xC0, 0xC1, 0xC2, 0xC3,
-                    0xC5, 0xC6, 0xC7,
-                    0xC9, 0xCA, 0xCB,
-                    0xCD, 0xCE, 0xCF,
-                }:
-                    if i + 7 < end:
-                        h = int.from_bytes(content[i + 3:i + 5], "big")
-                        w = int.from_bytes(content[i + 5:i + 7], "big")
-                        if w > 0 and h > 0:
-                            return w, h
-                    break
-                i += seg_len
-
-        # WEBP (basic VP8X / VP8L parse)
-        if len(content) >= 30 and content[0:4] == b"RIFF" and content[8:12] == b"WEBP":
-            chunk = content[12:16]
-            if chunk == b"VP8X" and len(content) >= 30:
-                w = 1 + int.from_bytes(content[24:27], "little")
-                h = 1 + int.from_bytes(content[27:30], "little")
-                if w > 0 and h > 0:
-                    return w, h
-            if chunk == b"VP8L" and len(content) >= 25:
-                b0 = content[21]
-                b1 = content[22]
-                b2 = content[23]
-                b3 = content[24]
-                w = 1 + (((b1 & 0x3F) << 8) | b0)
-                h = 1 + (((b3 & 0x0F) << 10) | (b2 << 2) | ((b1 & 0xC0) >> 6))
-                if w > 0 and h > 0:
-                    return w, h
-    except Exception:
-        pass
-
-    return None, None
-
-
-def _closest_allowed_aspect_ratio(width: Optional[int], height: Optional[int]) -> Optional[str]:
-    if not width or not height or width <= 0 or height <= 0:
-        return None
-
-    target = width / height
-    ratio_values = {
-        "1:1": 1.0,
-        "2:3": 2 / 3,
-        "3:2": 3 / 2,
-        "9:16": 9 / 16,
-        "16:9": 16 / 9,
-    }
-    best = min(ratio_values.items(), key=lambda kv: abs(kv[1] - target))[0]
-    return best
-
-
 def validate_edit_request(request: ImageEditRequest, images: list):
     """验证图片编辑请求参数"""
     if request.model != "grok-imagine-1.0-edit":
@@ -497,14 +435,6 @@ async def create_image(request: ImageGenerationRequest):
     response_format = resolve_response_format(request.response_format)
     response_field = response_field_name(response_format)
 
-    logger.info(
-        f"[request-trace] image_gen.raw_body body={request.model_dump(by_alias=True)}"
-    )
-
-    logger.info(
-        f"[aspect-ratio-trace] image_gen.request model={request.model} size={request.size} resolution={request.resolution} aspect_ratio={request.aspect_ratio} n={request.n} stream={request.stream}"
-    )
-
     # compatibility: when caller sends only resolution, treat it as size.
     normalize_size_input = request.size
     if request.resolution and str(request.resolution).strip():
@@ -514,10 +444,6 @@ async def create_image(request: ImageGenerationRequest):
     normalized_size, aspect_ratio = _normalize_size_and_aspect(
         size=normalize_size_input,
         aspect_ratio=request.aspect_ratio,
-    )
-
-    logger.info(
-        f"[aspect-ratio-trace] image_gen.normalized model={request.model} normalized_size={normalized_size} normalized_aspect_ratio={aspect_ratio}"
     )
 
     # 获取 token 和模型信息
@@ -577,30 +503,6 @@ async def edit_image(request: Request):
     # ------------------------------------------------------------------
     form = await request.form()
 
-    # 完整请求体日志（文本字段 + 文件元信息）
-    raw_text_fields = {}
-    raw_file_fields = []
-    for key in form:
-        values = form.getlist(key)
-        text_values = []
-        for value in values:
-            if _is_upload_file(value):
-                raw_file_fields.append(
-                    {
-                        "field": key,
-                        "filename": getattr(value, "filename", None),
-                        "content_type": getattr(value, "content_type", None),
-                    }
-                )
-            else:
-                text_values.append(str(value))
-        if text_values:
-            raw_text_fields[key] = text_values if len(text_values) > 1 else text_values[0]
-
-    logger.info(
-        f"[request-trace] image_edit.raw_form text_fields={raw_text_fields} file_fields={raw_file_fields}"
-    )
-
     # 提取文本字段（带默认值）
     prompt = form.get("prompt")
     if not prompt or not str(prompt).strip():
@@ -625,13 +527,6 @@ async def edit_image(request: Request):
     if aspect_ratio_raw is None:
         aspect_ratio_raw = form.get("aspectRatio")
     aspect_ratio_val = str(aspect_ratio_raw).strip() if aspect_ratio_raw else None
-
-    logger.info(
-        f"[aspect-ratio-trace] image_edit.form_keys keys={list(form.keys())}"
-    )
-    logger.info(
-        f"[aspect-ratio-trace] image_edit.form model={model} has_size_field={has_size_field} raw_size={size_raw} raw_resolution={resolution_raw} effective_size={effective_size_raw} raw_aspect_ratio={form.get('aspect_ratio')} raw_aspectRatio={form.get('aspectRatio')} n={n}"
-    )
 
     quality = str(form.get("quality", "standard"))
     response_format_raw = form.get("response_format")
@@ -716,8 +611,6 @@ async def edit_image(request: Request):
     allowed_types = {"image/png", "image/jpeg", "image/webp", "image/jpg"}
 
     images: List[str] = []
-    inferred_width: Optional[int] = None
-    inferred_height: Optional[int] = None
 
     for item in uploaded_files:
         content = await item.read()
@@ -752,41 +645,26 @@ async def edit_image(request: Request):
                     code="invalid_image_type",
                 )
 
-        if inferred_width is None or inferred_height is None:
-            w, h = _detect_image_dimensions(content, mime)
-            if w and h:
-                inferred_width, inferred_height = w, h
-
         b64 = base64.b64encode(content).decode()
         images.append(f"data:{mime};base64,{b64}")
 
     # ------------------------------------------------------------------
-    # 4. 归一化比例（新增：在未传 size/aspectRatio 时，自动推断上传图比例）
+    # 4. 归一化比例（去掉参考图推断：仅显式参数或 prompt 正则提取）
     # ------------------------------------------------------------------
     normalize_size_input = edit_request.size if has_size_field else None
     normalize_aspect_input = edit_request.aspect_ratio
 
-    inferred_aspect = None
     if not normalize_aspect_input and not has_size_field:
-        inferred_aspect = _closest_allowed_aspect_ratio(inferred_width, inferred_height)
-        if inferred_aspect:
-            normalize_aspect_input = inferred_aspect
+        normalize_aspect_input = _extract_aspect_ratio_from_prompt(edit_request.prompt)
 
     if normalize_size_input is None and not normalize_aspect_input:
-        # 保持历史兼容：无任何提示且无法推断时，默认 1:1
+        # 保持历史兼容：无任何提示时默认 1:1
         normalized_size, aspect_ratio = "1024x1024", "1:1"
     else:
         normalized_size, aspect_ratio = _normalize_size_and_aspect(
             size=normalize_size_input,
             aspect_ratio=normalize_aspect_input,
         )
-
-    logger.info(
-        f"[aspect-ratio-trace] image_edit.infer inferred_width={inferred_width} inferred_height={inferred_height} inferred_aspect={inferred_aspect}"
-    )
-    logger.info(
-        f"[aspect-ratio-trace] image_edit.normalized model={edit_request.model} normalized_size={normalized_size} normalized_aspect_ratio={aspect_ratio} request_size={edit_request.size} request_resolution={edit_request.resolution} request_aspect_ratio={edit_request.aspect_ratio} has_size_field={has_size_field}"
-    )
 
     # ------------------------------------------------------------------
     # 5. 调用编辑服务
