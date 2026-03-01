@@ -1,7 +1,7 @@
 """
 Video Generation API 路由
 
-兼容 OpenAI Sora 风格的视频 API:
+兼容 OpenAI Sora 风格的视频 API：
   POST /v1/videos          — 创建视频生成任务（异步）
   POST /v1/video/create    — 备用端点（同上）
   GET  /v1/videos/{id}     — 查询任务状态 / 获取结果
@@ -37,6 +37,22 @@ _TASK_TTL_SECONDS = 3600  # Auto-expire completed tasks after 1 hour
 
 # Maximum reference images for video generation
 _MAX_VIDEO_REFERENCE_IMAGES = 3
+
+_GROK_ASSETS_BASE = "https://assets.grok.com/"
+
+
+def _ensure_full_url(url: str) -> str:
+    """Ensure Grok asset URL is a full URL, not a relative path."""
+    if not url:
+        return url
+    # Already a full URL
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    # data: URI — pass through
+    if url.startswith("data:"):
+        return url
+    # Relative path from Grok (e.g. "users/.../generated_video.mp4")
+    return f"{_GROK_ASSETS_BASE}{url}"
 
 
 def _cleanup_expired() -> None:
@@ -169,6 +185,10 @@ async def _run_video_task(task_id: str, params: Dict[str, Any]) -> None:
                         await session.close()
             except Exception as e:
                 logger.warning(f"[VideoTask {task_id}] Upscale failed: {e}")
+
+        # ---- Ensure full URLs ------------------------------------------------
+        video_url = _ensure_full_url(video_url)
+        thumbnail_url = _ensure_full_url(thumbnail_url)
 
         if video_url:
             _tasks[task_id].update(
