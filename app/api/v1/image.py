@@ -191,7 +191,7 @@ def resolve_aspect_ratio(size: str) -> str:
     return "2:3"
 
 
-def validate_edit_request(request: ImageEditRequest, images: List[UploadFile]):
+def validate_edit_request(request: ImageEditRequest, images: list):
     """验证图片编辑请求参数"""
     if request.model != "grok-imagine-1.0-edit":
         raise ValidationException(
@@ -253,6 +253,18 @@ async def _get_token(model: str):
 # instead of repeating "image".  We accept both.
 # ---------------------------------------------------------------------------
 _IMAGE_FIELD_NAMES = {"image", "image[]"}
+
+
+def _is_upload_file(obj) -> bool:
+    """Check whether *obj* is an UploadFile using duck typing.
+
+    We cannot rely on ``isinstance(obj, UploadFile)`` because FastAPI
+    re-exports ``UploadFile`` from ``fastapi`` while Starlette internally
+    creates instances from ``starlette.datastructures.UploadFile``.
+    When these two import paths diverge the ``isinstance`` check fails
+    even though the object is perfectly usable as an UploadFile.
+    """
+    return hasattr(obj, "read") and hasattr(obj, "filename")
 
 
 @router.post("/images/generations")
@@ -340,28 +352,6 @@ async def edit_image(request: Request):
     # ------------------------------------------------------------------
     form = await request.form()
 
-    # ====== DEBUG: 打印 form 中所有字段信息 ======
-    logger.warning("===== [DEBUG] /images/edits form fields =====")
-    for key in form:
-        raw_values = form.getlist(key)
-        for idx, v in enumerate(raw_values):
-            if isinstance(v, UploadFile):
-                logger.warning(
-                    f"  field={key!r} [{idx}] => UploadFile("
-                    f"filename={v.filename!r}, "
-                    f"content_type={v.content_type!r}, "
-                    f"size={v.size})"
-                )
-            else:
-                # 截断过长的值
-                val_str = str(v)
-                if len(val_str) > 200:
-                    val_str = val_str[:200] + "...(truncated)"
-                logger.warning(
-                    f"  field={key!r} [{idx}] => type={type(v).__name__}, value={val_str!r}"
-                )
-    logger.warning("===== [DEBUG] end of form fields =====")
-
     # 提取文本字段（带默认值）
     prompt = form.get("prompt")
     if not prompt or not str(prompt).strip():
@@ -387,18 +377,28 @@ async def edit_image(request: Request):
         stream_str = str(stream_raw).lower()
         stream = stream_str in ("true", "1", "yes")
 
+    # ------------------------------------------------------------------
     # 提取上传的图片文件 —— 兼容多种字段名
-    uploaded_files: List[UploadFile] = []
+    # 使用鸭子类型 (_is_upload_file) 代替 isinstance(v, UploadFile)，
+    # 因为 FastAPI 和 Starlette 的 UploadFile 可能是不同的类对象。
+    # ------------------------------------------------------------------
+    uploaded_files = []
     for key in form:
         if key in _IMAGE_FIELD_NAMES:
             values = form.getlist(key)
-            logger.warning(f"[DEBUG] Matching field={key!r}, getlist returned {len(values)} items")
+            logger.debug(
+                f"Found image field {key!r} with {len(values)} item(s)"
+            )
             for v in values:
-                logger.warning(f"[DEBUG]   item type={type(v).__name__}, is UploadFile={isinstance(v, UploadFile)}")
-                if isinstance(v, UploadFile):
+                if _is_upload_file(v):
                     uploaded_files.append(v)
+                else:
+                    logger.warning(
+                        f"Skipping non-file value in field {key!r}: "
+                        f"type={type(v).__name__}"
+                    )
 
-    logger.warning(f"[DEBUG] Total uploaded_files collected: {len(uploaded_files)}")
+    logger.info(f"Collected {len(uploaded_files)} uploaded image(s)")
 
     # ------------------------------------------------------------------
     # 2. 构建 Pydantic 请求对象进行校验
