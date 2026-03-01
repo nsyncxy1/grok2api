@@ -147,11 +147,11 @@ def _normalize_size_and_aspect(*, size: Optional[str], aspect_ratio: Optional[st
 
     if aspect_val and _is_aspect_ratio(aspect_val):
         ar = resolve_aspect_ratio(aspect_val)
-        # If caller didn't specify a real pixel size (or sent a ratio in size),
-        # choose a canonical pixel size for metadata/validation.
-        if (not size_val) or _is_aspect_ratio(size_val) or (size_val not in ALLOWED_IMAGE_SIZES):
-            return ASPECT_TO_SIZE.get(ar, "1024x1024"), ar
-        return size_val, ar
+        # When aspect is explicitly provided, enforce canonical size for that aspect,
+        # unless caller size already matches the same ratio.
+        if size_val in ALLOWED_IMAGE_SIZES and SIZE_TO_ASPECT.get(size_val) == ar:
+            return size_val, ar
+        return ASPECT_TO_SIZE.get(ar, "1024x1024"), ar
 
     # No explicit aspect_ratio provided; interpret size.
     if _is_aspect_ratio(size_val):
@@ -654,8 +654,13 @@ async def edit_image(request: Request):
     normalize_size_input = edit_request.size if has_size_field else None
     normalize_aspect_input = edit_request.aspect_ratio
 
-    if not normalize_aspect_input and not has_size_field:
+    # 允许通过 prompt 指定比例；当存在 prompt 比例时，优先按比例生成。
+    if not normalize_aspect_input:
         normalize_aspect_input = _extract_aspect_ratio_from_prompt(edit_request.prompt)
+
+    # If aspect is known (explicit or extracted), do not let a stale/default size lock ratio to 1:1.
+    if normalize_aspect_input:
+        normalize_size_input = None
 
     if normalize_size_input is None and not normalize_aspect_input:
         # 保持历史兼容：无任何提示时默认 1:1
