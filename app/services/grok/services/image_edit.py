@@ -118,9 +118,10 @@ class ImageEditService:
                 tool_overrides = {"imageGen": True}
 
                 logger.info(
-                    "[image_edit] sending to grok: aspect_ratio={} image_urls={} parent_post_id={} model={}",
+                    "[image_edit] sending to grok: aspect_ratio=%s n=%d image_count=%d parent_post_id=%s model=%s",
                     aspect_ratio,
-                    [u[:80] for u in image_urls],
+                    n,
+                    len(image_urls),
                     parent_post_id,
                     model_info.grok_model,
                 )
@@ -284,7 +285,7 @@ class ImageEditService:
                 model_config_override=model_config_override,
             )
             processor = ImageCollectProcessor(
-                model_info.model_id, token, response_format=response_format
+                model_info.model_id, token, n=n, response_format=response_format
             )
             return await processor.process(response)
 
@@ -332,6 +333,25 @@ def _truncate(s: str, max_len: int = 500) -> str:
     return s[:max_len] + f"...<+{len(s) - max_len}>"
 
 
+def _log_model_response_meta(tag: str, mr: dict):
+    """Log key metadata from a grok modelResponse (dimensions, edit URIs, etc.)."""
+    # Image dimensions returned by grok
+    w = mr.get("generatedImageWidth")
+    h = mr.get("generatedImageHeight")
+    if w or h:
+        logger.info("[%s] grok returned dimensions: %sx%s", tag, w, h)
+
+    # imageEditUris — grok edit-specific field
+    edit_uris = mr.get("imageEditUris")
+    if edit_uris:
+        logger.info("[%s] grok imageEditUris: %s", tag, edit_uris)
+
+    # mediaTypes
+    media_types = mr.get("mediaTypes")
+    if media_types:
+        logger.info("[%s] grok mediaTypes: %s", tag, media_types)
+
+
 class ImageStreamProcessor(BaseProcessor):
     """HTTP image stream processor."""
 
@@ -377,37 +397,14 @@ class ImageStreamProcessor(BaseProcessor):
                 try:
                     data = orjson.loads(line)
                 except orjson.JSONDecodeError:
-                    logger.warning(
-                        "[image_edit_stream] line#{} JSON decode failed: {}",
-                        line_count, _truncate(line),
-                    )
                     continue
 
                 resp = data.get("result", {}).get("response", {})
-
-                # Log every upstream response chunk (keys only to avoid huge logs)
-                resp_keys = list(resp.keys()) if resp else []
-                if line_count <= 5 or resp_keys:
-                    logger.info(
-                        "[image_edit_stream] line#{} resp_keys={} has_result={}",
-                        line_count, resp_keys, "result" in data,
-                    )
-
-                # Log the full first response and any modelResponse for debugging
-                if line_count == 1:
-                    logger.info(
-                        "[image_edit_stream] first line (full): {}",
-                        _truncate(line, 2000),
-                    )
 
                 # Image generation progress
                 if img := resp.get("streamingImageGenerationResponse"):
                     image_index = img.get("imageIndex", 0)
                     progress = img.get("progress", 0)
-                    logger.debug(
-                        "[image_edit_stream] progress: index={} progress={}%",
-                        image_index, progress,
-                    )
 
                     if self.n == 1 and image_index != self.target_index:
                         continue
@@ -428,97 +425,81 @@ class ImageStreamProcessor(BaseProcessor):
 
                 # modelResponse — this is where grok returns generated images
                 if mr := resp.get("modelResponse"):
-                    # Log the full modelResponse structure (without huge blobs)
-                    mr_keys = list(mr.keys()) if isinstance(mr, dict) else type(mr).__name__
-                    logger.info(
-                        "[image_edit_stream] modelResponse keys={}", mr_keys,
-                    )
-
-                    # Log message field if present (grok sometimes returns text instead of images)
-                    if msg := mr.get("message"):
-                        logger.info(
-                            "[image_edit_stream] modelResponse.message={}",
-                            _truncate(str(msg), 1000),
-                        )
-
-                    # Log generatedImageUrls / imageUrls etc.
-                    for url_key in ("generatedImageUrls", "imageUrls", "imageURLs"):
-                        if url_key in mr:
-                            logger.info(
-                                "[image_edit_stream] modelResponse.{}={}",
-                                url_key, mr[url_key],
-                            )
+                    _log_model_response_meta("image_edit_stream", mr)
 
                     urls = _collect_images(mr)
                     logger.info(
-                        "[image_edit_stream] collected {} image URL(s): {}",
-                        len(urls),
-                        [u[:100] for u in urls] if urls else [],
+                        "[image_edit_stream] collected %d image URL(s) (n=%d)",
+                        len(urls), self.n,
                     )
 
-                    if urls:
-                        for url in urls:
-                            if self.response_format == "url":
-                                processed = await self.process_url(url, "image")
-                                if processed:
-                                    final_images.append(processed)
-                                continue
-                            try:
-                                dl_service = self._get_dl()
-                                base64_data = await dl_service.parse_b64(
-                                    url, self.token, "image"
-                                )
-                                if base64_data:
-                                    if "," in base64_data:
-                                        b64 = base64_data.split(",", 1)[1]
-                                    else:
-                                        b64 = base64_data
-                                    final_images.append(b64)
-                                    logger.info(
-                                        "[image_edit_stream] downloaded image: url={} b64_len={}",
-                                        url[:80], len(b64),
-                                    )
-                                else:
-                                    logger.warning(
-                                        "[image_edit_stream] parse_b64 returned empty for url={}",
-                                        url[:80],
-                                    )
-                            except Exception as e:
-                                logger.warning(
-                                    "[image_edit_stream] b64 download failed (url={}): {}, falling back to URL",
-                                    url[:80], e,
-                                )
-                                processed = await self.process_url(url, "image")
-                                if processed:
-                                    final_images.append(processed)
-                    else:
-                        # No image URLs found in modelResponse — log the full response
-                        # to help diagnose unexpected grok return format
-                        logger.warning(
-                            "[image_edit_stream] modelResponse has NO image URLs! full mr={}",
-                            _truncate(orjson.dumps(mr).decode(), 3000),
+                    if not urls:
+                        # Log message if grok returned text instead of images
+                        if msg := mr.get("message"):
+                            logger.warning(
+                                "[image_edit_stream] grok returned text instead of images: %s",
+                                _truncate(str(msg), 500),
+                            )
+                        else:
+                            logger.warning(
+                                "[image_edit_stream] modelResponse has NO image URLs! keys=%s",
+                                list(mr.keys()),
+                            )
+                        continue
+
+                    # Only download up to n images
+                    urls_to_use = urls[:self.n]
+                    if len(urls) > self.n:
+                        logger.info(
+                            "[image_edit_stream] grok returned %d images but n=%d, using first %d",
+                            len(urls), self.n, self.n,
                         )
+
+                    for url in urls_to_use:
+                        if self.response_format == "url":
+                            processed = await self.process_url(url, "image")
+                            if processed:
+                                final_images.append(processed)
+                            continue
+                        try:
+                            dl_service = self._get_dl()
+                            base64_data = await dl_service.parse_b64(
+                                url, self.token, "image"
+                            )
+                            if base64_data:
+                                if "," in base64_data:
+                                    b64 = base64_data.split(",", 1)[1]
+                                else:
+                                    b64 = base64_data
+                                final_images.append(b64)
+                                logger.info(
+                                    "[image_edit_stream] downloaded image: b64_len=%d",
+                                    len(b64),
+                                )
+                            else:
+                                logger.warning(
+                                    "[image_edit_stream] parse_b64 returned empty for url=%s",
+                                    url[:80],
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                "[image_edit_stream] b64 download failed (url=%s): %s, falling back to URL",
+                                url[:80], e,
+                            )
+                            processed = await self.process_url(url, "image")
+                            if processed:
+                                final_images.append(processed)
                     continue
 
-                # Log any unexpected response keys
-                unexpected_keys = [k for k in resp_keys if k not in (
-                    "streamingImageGenerationResponse", "modelResponse",
-                    "token", "llmInfo", "responseId", "rolloutId",
-                    "isThinking", "cardAttachment",
-                )]
-                if unexpected_keys:
-                    logger.info(
-                        "[image_edit_stream] line#{} unexpected keys: {} data={}",
-                        line_count, unexpected_keys,
-                        _truncate(line, 1000),
-                    )
-
             logger.info(
-                "[image_edit_stream] stream ended: total_lines={} final_images={}",
-                line_count, len(final_images),
+                "[image_edit_stream] stream ended: total_lines=%d final_images=%d (n=%d)",
+                line_count, len(final_images), self.n,
             )
 
-            for index, img_data in enumerate(final_images):
+            # Truncate to n
+            output_images = final_images[:self.n]
+
+            for index, img_data in enumerate(output_images):
                 if self.n == 1:
                     if index != self.target_index:
                         continue
@@ -583,9 +564,9 @@ class ImageStreamProcessor(BaseProcessor):
                     )
                 yield "data: [DONE]\n\n"
 
-            if not final_images:
+            if not output_images:
                 logger.error(
-                    "[image_edit_stream] FAILED: no images produced after {} lines from grok",
+                    "[image_edit_stream] FAILED: no images produced after %d lines from grok",
                     line_count,
                 )
 
@@ -628,10 +609,11 @@ class ImageStreamProcessor(BaseProcessor):
 class ImageCollectProcessor(BaseProcessor):
     """HTTP image non-stream processor."""
 
-    def __init__(self, model: str, token: str = "", response_format: str = "b64_json"):
+    def __init__(self, model: str, token: str = "", n: int = 1, response_format: str = "b64_json"):
         if response_format == "base64":
             response_format = "b64_json"
         super().__init__(model, token)
+        self.n = n
         self.response_format = response_format
 
     async def process(self, response: AsyncIterable[bytes]) -> List[str]:
@@ -651,74 +633,74 @@ class ImageCollectProcessor(BaseProcessor):
                 try:
                     data = orjson.loads(line)
                 except orjson.JSONDecodeError:
-                    logger.warning(
-                        "[image_edit_collect] line#{} JSON decode failed: {}",
-                        line_count, _truncate(line),
-                    )
                     continue
 
                 resp = data.get("result", {}).get("response", {})
 
                 if mr := resp.get("modelResponse"):
-                    mr_keys = list(mr.keys()) if isinstance(mr, dict) else type(mr).__name__
-                    logger.info(
-                        "[image_edit_collect] line#{} modelResponse keys={}",
-                        line_count, mr_keys,
-                    )
-
-                    # Log message if present
-                    if msg := mr.get("message"):
-                        logger.info(
-                            "[image_edit_collect] modelResponse.message={}",
-                            _truncate(str(msg), 1000),
-                        )
+                    _log_model_response_meta("image_edit_collect", mr)
 
                     urls = _collect_images(mr)
                     logger.info(
-                        "[image_edit_collect] collected {} image URL(s): {}",
-                        len(urls),
-                        [u[:100] for u in urls] if urls else [],
+                        "[image_edit_collect] collected %d image URL(s) (n=%d)",
+                        len(urls), self.n,
                     )
 
                     if not urls:
-                        logger.warning(
-                            "[image_edit_collect] modelResponse has NO image URLs! full mr={}",
-                            _truncate(orjson.dumps(mr).decode(), 3000),
+                        if msg := mr.get("message"):
+                            logger.warning(
+                                "[image_edit_collect] grok returned text instead of images: %s",
+                                _truncate(str(msg), 500),
+                            )
+                        else:
+                            logger.warning(
+                                "[image_edit_collect] modelResponse has NO image URLs! keys=%s",
+                                list(mr.keys()),
+                            )
+                        continue
+
+                    # Only download up to n images
+                    urls_to_use = urls[:self.n]
+                    if len(urls) > self.n:
+                        logger.info(
+                            "[image_edit_collect] grok returned %d images but n=%d, using first %d",
+                            len(urls), self.n, self.n,
                         )
 
-                    if urls:
-                        for url in urls:
-                            if self.response_format == "url":
-                                processed = await self.process_url(url, "image")
-                                if processed:
-                                    images.append(processed)
-                                continue
-                            try:
-                                dl_service = self._get_dl()
-                                base64_data = await dl_service.parse_b64(
-                                    url, self.token, "image"
+                    for url in urls_to_use:
+                        if len(images) >= self.n:
+                            break
+                        if self.response_format == "url":
+                            processed = await self.process_url(url, "image")
+                            if processed:
+                                images.append(processed)
+                            continue
+                        try:
+                            dl_service = self._get_dl()
+                            base64_data = await dl_service.parse_b64(
+                                url, self.token, "image"
+                            )
+                            if base64_data:
+                                if "," in base64_data:
+                                    b64 = base64_data.split(",", 1)[1]
+                                else:
+                                    b64 = base64_data
+                                images.append(b64)
+                                logger.info(
+                                    "[image_edit_collect] downloaded image: b64_len=%d",
+                                    len(b64),
                                 )
-                                if base64_data:
-                                    if "," in base64_data:
-                                        b64 = base64_data.split(",", 1)[1]
-                                    else:
-                                        b64 = base64_data
-                                    images.append(b64)
-                                    logger.info(
-                                        "[image_edit_collect] downloaded image: b64_len={}",
-                                        len(b64),
-                                    )
-                            except Exception as e:
-                                logger.warning(
-                                    f"Failed to convert image to base64, falling back to URL: {e}"
-                                )
-                                processed = await self.process_url(url, "image")
-                                if processed:
-                                    images.append(processed)
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to convert image to base64, falling back to URL: {e}"
+                            )
+                            processed = await self.process_url(url, "image")
+                            if processed:
+                                images.append(processed)
 
             logger.info(
-                "[image_edit_collect] done: total_lines={} images={}",
-                line_count, len(images),
+                "[image_edit_collect] done: total_lines=%d images=%d (n=%d)",
+                line_count, len(images), self.n,
             )
 
         except asyncio.CancelledError:
@@ -738,7 +720,7 @@ class ImageCollectProcessor(BaseProcessor):
         finally:
             await self.close()
 
-        return images
+        return images[:self.n]
 
 
 __all__ = ["ImageEditService", "ImageEditResult"]
