@@ -137,18 +137,12 @@ def _normalize_size_and_aspect(*, size: Optional[str], aspect_ratio: Optional[st
     - Accepts OpenAI-like size (e.g. 720x1280)
     - Also accepts ratio-like size (e.g. 9:16)
     - Also accepts explicit aspect_ratio/aspectRatio which takes precedence
-
-    This is the key compatibility bridge for callers that only know about
-    `aspectRatio` (like storyboard/video pipelines) while still supporting
-    OpenAI clients that use `size`.
     """
     size_val = (size or "").strip()
     aspect_val = (aspect_ratio or "").strip()
 
     if aspect_val and _is_aspect_ratio(aspect_val):
         ar = resolve_aspect_ratio(aspect_val)
-        # When aspect is explicitly provided, enforce canonical size for that aspect,
-        # unless caller size already matches the same ratio.
         if size_val in ALLOWED_IMAGE_SIZES and SIZE_TO_ASPECT.get(size_val) == ar:
             return size_val, ar
         return ASPECT_TO_SIZE.get(ar, "1024x1024"), ar
@@ -165,84 +159,58 @@ def _normalize_size_and_aspect(*, size: Optional[str], aspect_ratio: Optional[st
     return size_val, ar
 
 
-def _truncate_for_log(value: object, *, max_len: int = 2000) -> str:
-    """Convert value to string safely and truncate for logging."""
-    if value is None:
-        return "<None>"
-    try:
-        s = str(value)
-    except Exception:
-        return f"<{type(value).__name__}>"
-    if len(s) > max_len:
-        return s[:max_len] + "...<truncated>"
-    return s
+# ---------------------------------------------------------------------------
+# Prompt → aspect ratio extraction
+# ---------------------------------------------------------------------------
+
+# Pre-compiled: full-width digit translation table
+_FULLWIDTH_DIGIT_TABLE = str.maketrans("０１２３４５６７８９", "0123456789")
+
+# Separator characters that can appear between W and H in a ratio expression.
+# Covers: : ： ∶ / ／ x X ×
+_SEP = r"[:/xX×]"
+
+# Only match ratios we actually support, with optional whitespace around sep.
+_ASPECT_PATTERN = re.compile(
+    rf"(?<!\d)(1\s*{_SEP}\s*1|2\s*{_SEP}\s*3|3\s*{_SEP}\s*2|9\s*{_SEP}\s*16|16\s*{_SEP}\s*9)(?!\d)"
+)
 
 
 def _extract_aspect_ratio_from_prompt(prompt: str) -> Optional[str]:
-    """Extract allowed aspect ratio from prompt text via regex.
+    """Extract allowed aspect ratio from prompt text.
 
     Supports patterns like:
     - 9:16, 9：16, 9∶16, ９：１６ (full-width digits)
-    - 9/16
+    - 9/16, 9／16
     - 9x16, 9X16, 9×16
-
-    This function prints DEBUG logs to diagnose extraction failures.
     """
     if not prompt:
-        logger.debug("[aspect] prompt is empty")
         return None
 
-    normalized = str(prompt)
-
-    # Normalize full-width digits (０-９) to ASCII (0-9)
-    normalized = normalized.translate(
-        str.maketrans("０１２３４５６７８９", "0123456789")
-    )
-
-    # normalize common separators
+    # Normalize full-width digits and separators
+    normalized = prompt.translate(_FULLWIDTH_DIGIT_TABLE)
     normalized = (
         normalized.replace("：", ":")
-        .replace("∶", ":")  # U+2236 ratio sign
+        .replace("∶", ":")   # U+2236 ratio sign
         .replace("／", "/")  # full-width slash
     )
 
-    # NOTE: keep the regex strict (only known aspect ratios) but accept several separators.
-    sep = r"[:/xX×]"
-    pattern = rf"(?<!\d)(1\s*{sep}\s*1|2\s*{sep}\s*3|3\s*{sep}\s*2|9\s*{sep}\s*16|16\s*{sep}\s*9)(?!\d)"
-
-    match = re.search(pattern, normalized)
-
-    logger.debug(
-        "[aspect] extract from prompt: raw={} normalized={} pattern={} matched={}",
-        _truncate_for_log(prompt, max_len=2000),
-        _truncate_for_log(normalized, max_len=2000),
-        pattern,
-        bool(match),
-    )
-
+    match = _ASPECT_PATTERN.search(normalized)
     if not match:
+        logger.debug("[aspect] no ratio found in prompt (len={})", len(prompt))
         return None
 
     raw_token = match.group(1)
+    # Collapse whitespace, unify separator to ':'
     token = re.sub(r"\s+", "", raw_token)
-    token = re.sub(sep, ":", token)
-
-    logger.debug(
-        "[aspect] match: raw_token={} cleaned_token={} span={}",
-        raw_token,
-        token,
-        match.span(1),
-    )
+    token = re.sub(_SEP, ":", token)
 
     if _is_aspect_ratio(token):
         resolved = resolve_aspect_ratio(token)
-        logger.debug("[aspect] resolved aspect_ratio={}", resolved)
+        logger.debug("[aspect] extracted from prompt: {} -> {}", raw_token, resolved)
         return resolved
 
-    logger.debug(
-        "[aspect] cleaned token is not in allowed aspect ratios: {}",
-        token,
-    )
+    logger.debug("[aspect] token {} not in allowed ratios", token)
     return None
 
 
@@ -452,21 +420,12 @@ async def _get_token(model: str):
 
 # ---------------------------------------------------------------------------
 # Accepted multipart field names for image uploads.
-# Many clients (OpenAI SDK, curl, etc.) send multiple files as "image[]"
-# instead of repeating "image".  We accept both.
 # ---------------------------------------------------------------------------
 _IMAGE_FIELD_NAMES = {"image", "image[]"}
 
 
 def _is_upload_file(obj) -> bool:
-    """Check whether *obj* is an UploadFile using duck typing.
-
-    We cannot rely on ``isinstance(obj, UploadFile)`` because FastAPI
-    re-exports ``UploadFile`` from ``fastapi`` while Starlette internally
-    creates instances from ``starlette.datastructures.UploadFile``.
-    When these two import paths diverge the ``isinstance`` check fails
-    even though the object is perfectly usable as an UploadFile.
-    """
+    """Check whether *obj* is an UploadFile using duck typing."""
     return hasattr(obj, "read") and hasattr(obj, "filename")
 
 
@@ -563,92 +522,9 @@ async def edit_image(request: Request):
     - size 也支持直接传比例字符串，例如 size=9:16
     """
     # ------------------------------------------------------------------
-    # 0) 打印原始 body 预览（用于排查客户端实际发送了什么）
-    # 注意：multipart body 里包含二进制图片，不能全量打印；这里只打印长度 + 前缀预览。
-    # 先读取 body 再解析 form，确保还能解析 multipart。
-    # ------------------------------------------------------------------
-    raw_body = b""
-    try:
-        raw_body = await request.body()
-        ct = request.headers.get("content-type")
-        logger.info(
-            "[/v1/images/edits] raw body: content_length={} bytes_read={} content_type={}",
-            request.headers.get("content-length"),
-            len(raw_body),
-            ct,
-        )
-
-        # 仅打印前缀，避免日志爆炸/泄露整张图
-        preview = raw_body[:2048]
-        try:
-            preview_text = preview.decode("utf-8", errors="replace")
-        except Exception:
-            preview_text = "<decode_failed>"
-
-        logger.info(
-            "[/v1/images/edits] raw body preview (first {} bytes) as bytes(repr)={} ",
-            len(preview),
-            repr(preview),
-        )
-        logger.info(
-            "[/v1/images/edits] raw body preview (first {} bytes) as utf8(replace)={}",
-            len(preview),
-            _truncate_for_log(preview_text, max_len=2000),
-        )
-    except Exception:
-        logger.exception("[/v1/images/edits] failed to read/log raw body")
-
-    # ------------------------------------------------------------------
-    # 1. 手动解析 multipart form data
+    # 1. 解析 multipart form data
     # ------------------------------------------------------------------
     form = await request.form()
-
-    # ------------------------------------------------------------------
-    # 1.1 打印请求内容（用于排查 prompt 中比例提取失败等问题）
-    # ------------------------------------------------------------------
-    try:
-        # Avoid leaking secrets (api keys, auth headers, cookies)
-        sensitive_headers = {"authorization", "x-api-key", "cookie"}
-        safe_headers = {
-            k: v
-            for k, v in request.headers.items()
-            if k.lower() not in sensitive_headers
-        }
-        logger.info(
-            "[/v1/images/edits] incoming request: content-type={} query={} headers={}",
-            request.headers.get("content-type"),
-            dict(request.query_params),
-            safe_headers,
-        )
-    except Exception:
-        logger.exception("[/v1/images/edits] failed to log request headers")
-
-    # Summarize multipart fields (do NOT read file bytes here)
-    try:
-        field_summaries = []
-        for k, v in form.multi_items():
-            if _is_upload_file(v):
-                field_summaries.append(
-                    {
-                        "key": k,
-                        "type": "file",
-                        "filename": getattr(v, "filename", None),
-                        "content_type": getattr(v, "content_type", None),
-                    }
-                )
-            else:
-                sv = _truncate_for_log(v, max_len=1000)
-                field_summaries.append(
-                    {
-                        "key": k,
-                        "type": "text",
-                        "value": sv,
-                        "len": len(str(v)) if v is not None else 0,
-                    }
-                )
-        logger.info("[/v1/images/edits] multipart fields={}", field_summaries)
-    except Exception:
-        logger.exception("[/v1/images/edits] failed to summarize multipart fields")
 
     # 提取文本字段（带默认值）
     prompt = form.get("prompt")
@@ -692,19 +568,13 @@ async def edit_image(request: Request):
         stream = stream_str in ("true", "1", "yes")
 
     logger.info(
-        "[/v1/images/edits] parsed fields: model={} n={} size_raw={} resolution_raw={} "
-        "has_size_field={} aspect_ratio_raw={} response_format={} stream_raw={}",
-        model,
-        n,
-        size_raw,
-        resolution_raw,
-        has_size_field,
+        "[/v1/images/edits] model={} n={} size={} aspect_ratio={} response_format={} prompt_len={}",
+        model, n,
+        size_raw or resolution_raw,
         aspect_ratio_raw,
         response_format_val,
-        stream_raw,
+        len(prompt),
     )
-    # Use repr to expose invisible characters in prompt
-    logger.info("[/v1/images/edits] prompt(repr)={}", repr(prompt))
 
     # ------------------------------------------------------------------
     # 提取上传的图片文件 —— 兼容多种字段名
@@ -713,27 +583,14 @@ async def edit_image(request: Request):
     for key in form:
         if key in _IMAGE_FIELD_NAMES:
             values = form.getlist(key)
-            logger.debug("Found image field {} with {} item(s)", repr(key), len(values))
             for v in values:
                 if _is_upload_file(v):
                     uploaded_files.append(v)
-                else:
-                    logger.warning(
-                        "Skipping non-file value in field {}: type={}",
-                        repr(key),
-                        type(v).__name__,
-                    )
 
     logger.info(
-        "[/v1/images/edits] collected {} uploaded image(s): {}",
+        "[/v1/images/edits] {} image(s): {}",
         len(uploaded_files),
-        [
-            {
-                "filename": getattr(f, "filename", None),
-                "content_type": getattr(f, "content_type", None),
-            }
-            for f in uploaded_files
-        ],
+        [getattr(f, "filename", "?") for f in uploaded_files],
     )
 
     # ------------------------------------------------------------------
@@ -824,42 +681,26 @@ async def edit_image(request: Request):
                     code="invalid_image_type",
                 )
 
-        logger.info(
-            "[/v1/images/edits] read upload: filename={} content_type={} bytes={}",
-            repr(item.filename),
-            repr(item.content_type),
-            len(content),
-        )
-
         b64 = base64.b64encode(content).decode()
         images.append(f"data:{mime};base64,{b64}")
 
     # ------------------------------------------------------------------
-    # 4. 归一化比例（去掉参考图推断：仅显式参数或 prompt 正则提取）
+    # 4. 归一化比例（显式参数 > prompt 正则提取 > 默认 1:1）
     # ------------------------------------------------------------------
     normalize_size_input = edit_request.size if has_size_field else None
     normalize_aspect_input = edit_request.aspect_ratio
 
-    # 允许通过 prompt 指定比例；当存在 prompt 比例时，优先按比例生成。
+    # 允许通过 prompt 指定比例
     extracted_from_prompt = None
     if not normalize_aspect_input:
         extracted_from_prompt = _extract_aspect_ratio_from_prompt(edit_request.prompt)
         normalize_aspect_input = extracted_from_prompt
 
-    logger.info(
-        "[/v1/images/edits] aspect normalization: explicit_aspect={} extracted_from_prompt={} "
-        "normalize_size_input={}",
-        edit_request.aspect_ratio,
-        extracted_from_prompt,
-        normalize_size_input,
-    )
-
-    # If aspect is known (explicit or extracted), do not let a stale/default size lock ratio to 1:1.
+    # If aspect is known (explicit or extracted), do not let a stale/default size lock ratio.
     if normalize_aspect_input:
         normalize_size_input = None
 
     if normalize_size_input is None and not normalize_aspect_input:
-        # 保持历史兼容：无任何提示时默认 1:1
         normalized_size, aspect_ratio = "1024x1024", "1:1"
     else:
         normalized_size, aspect_ratio = _normalize_size_and_aspect(
@@ -868,9 +709,8 @@ async def edit_image(request: Request):
         )
 
     logger.info(
-        "[/v1/images/edits] normalized: size={} aspect_ratio={}",
-        normalized_size,
-        aspect_ratio,
+        "[/v1/images/edits] final: size={} aspect_ratio={} (from_prompt={})",
+        normalized_size, aspect_ratio, extracted_from_prompt,
     )
 
     # ------------------------------------------------------------------
