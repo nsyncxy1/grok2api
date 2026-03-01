@@ -8,9 +8,9 @@ import logging
 from pathlib import Path
 from typing import List, Optional, Union
 
-from fastapi import APIRouter, File, Form, Request, UploadFile
+from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, ConfigDict
 
 from app.services.grok.services.image import ImageGenerationService
 from app.services.grok.services.image_edit import ImageEditService
@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Images"])
 
+# Canonical sizes supported by this API layer (OpenAI-compatible).
 ALLOWED_IMAGE_SIZES = {
     "1280x720",
     "720x1280",
@@ -40,17 +41,35 @@ SIZE_TO_ASPECT = {
 }
 ALLOWED_ASPECT_RATIOS = {"1:1", "2:3", "3:2", "9:16", "16:9"}
 
+# Reverse mapping (choose a canonical size for a given aspect ratio).
+ASPECT_TO_SIZE = {
+    "16:9": "1280x720",
+    "9:16": "720x1280",
+    "3:2": "1792x1024",
+    "2:3": "1024x1792",
+    "1:1": "1024x1024",
+}
+
 
 class ImageGenerationRequest(BaseModel):
     """图片生成请求 - OpenAI 兼容"""
+
+    model_config = ConfigDict(populate_by_name=True)
 
     prompt: str = Field(..., description="图片描述")
     model: Optional[str] = Field("grok-imagine-1.0", description="模型名称")
     n: Optional[int] = Field(1, ge=1, le=10, description="生成数量 (1-10)")
     size: Optional[str] = Field(
         "1024x1024",
-        description="图片尺寸: 1280x720, 720x1280, 1792x1024, 1024x1792, 1024x1024",
+        description="图片尺寸: 1280x720, 720x1280, 1792x1024, 1024x1792, 1024x1024 或直接传比例 9:16/16:9/1:1",
     )
+    # Non-OpenAI field, accepted for compatibility with upstream callers (e.g. waoowaoo)
+    aspect_ratio: Optional[str] = Field(
+        None,
+        alias="aspectRatio",
+        description="图片比例: 1:1, 2:3, 3:2, 9:16, 16:9 (优先级高于 size)",
+    )
+
     quality: Optional[str] = Field("standard", description="图片质量 (暂不支持)")
     response_format: Optional[str] = Field(None, description="响应格式")
     style: Optional[str] = Field(None, description="风格 (暂不支持)")
@@ -60,18 +79,81 @@ class ImageGenerationRequest(BaseModel):
 class ImageEditRequest(BaseModel):
     """图片编辑请求 - OpenAI 兼容"""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     prompt: str = Field(..., description="编辑描述")
     model: Optional[str] = Field("grok-imagine-1.0-edit", description="模型名称")
     image: Optional[Union[str, List[str]]] = Field(None, description="待编辑图片文件")
     n: Optional[int] = Field(1, ge=1, le=10, description="生成数量 (1-10)")
     size: Optional[str] = Field(
         "1024x1024",
-        description="图片尺寸: 1280x720, 720x1280, 1792x1024, 1024x1792, 1024x1024",
+        description="图片尺寸: 1280x720, 720x1280, 1792x1024, 1024x1792, 1024x1024 或直接传比例 9:16/16:9/1:1",
     )
+    # Non-OpenAI field, accepted for compatibility with upstream callers.
+    aspect_ratio: Optional[str] = Field(
+        None,
+        alias="aspectRatio",
+        description="图片比例: 1:1, 2:3, 3:2, 9:16, 16:9 (优先级高于 size)",
+    )
+
     quality: Optional[str] = Field("standard", description="图片质量 (暂不支持)")
     response_format: Optional[str] = Field(None, description="响应格式")
     style: Optional[str] = Field(None, description="风格 (暂不支持)")
     stream: Optional[bool] = Field(False, description="是否流式输出")
+
+
+def _is_aspect_ratio(value: str) -> bool:
+    if not value:
+        return False
+    v = str(value).strip()
+    if v in ALLOWED_ASPECT_RATIOS:
+        return True
+    if ":" not in v:
+        return False
+    try:
+        left, right = v.split(":", 1)
+        left_i = int(left.strip())
+        right_i = int(right.strip())
+        if left_i <= 0 or right_i <= 0:
+            return False
+        normalized = f"{left_i}:{right_i}"
+        return normalized in ALLOWED_ASPECT_RATIOS
+    except (TypeError, ValueError):
+        return False
+
+
+def _normalize_size_and_aspect(*, size: Optional[str], aspect_ratio: Optional[str]):
+    """Return (normalized_size, normalized_aspect_ratio).
+
+    - Accepts OpenAI-like size (e.g. 720x1280)
+    - Also accepts ratio-like size (e.g. 9:16)
+    - Also accepts explicit aspect_ratio/aspectRatio which takes precedence
+
+    This is the key compatibility bridge for callers that only know about
+    `aspectRatio` (like storyboard/video pipelines) while still supporting
+    OpenAI clients that use `size`.
+    """
+    size_val = (size or "").strip()
+    aspect_val = (aspect_ratio or "").strip()
+
+    if aspect_val and _is_aspect_ratio(aspect_val):
+        ar = resolve_aspect_ratio(aspect_val)
+        # If caller didn't specify a real pixel size (or sent a ratio in size),
+        # choose a canonical pixel size for metadata/validation.
+        if (not size_val) or _is_aspect_ratio(size_val) or (size_val not in ALLOWED_IMAGE_SIZES):
+            return ASPECT_TO_SIZE.get(ar, "1024x1024"), ar
+        return size_val, ar
+
+    # No explicit aspect_ratio provided; interpret size.
+    if _is_aspect_ratio(size_val):
+        ar = resolve_aspect_ratio(size_val)
+        return ASPECT_TO_SIZE.get(ar, "1024x1024"), ar
+
+    # Standard OpenAI size.
+    ar = resolve_aspect_ratio(size_val)
+    if not size_val:
+        size_val = "1024x1024"
+    return size_val, ar
 
 
 def _validate_common_request(
@@ -119,12 +201,28 @@ def _validate_common_request(
                 code="invalid_response_format",
             )
 
-    if request.size and request.size not in ALLOWED_IMAGE_SIZES:
-        raise ValidationException(
-            message=f"size must be one of {sorted(ALLOWED_IMAGE_SIZES)}",
-            param="size",
-            code="invalid_size",
-        )
+    # NOTE: for compatibility, `size` can also be an aspect ratio string like "9:16".
+    if request.size:
+        size_val = str(request.size).strip()
+        if size_val not in ALLOWED_IMAGE_SIZES and not _is_aspect_ratio(size_val):
+            raise ValidationException(
+                message=(
+                    f"size must be one of {sorted(ALLOWED_IMAGE_SIZES)} "
+                    f"or an aspect ratio in {sorted(ALLOWED_ASPECT_RATIOS)}"
+                ),
+                param="size",
+                code="invalid_size",
+            )
+
+    # Validate optional explicit aspect_ratio as well.
+    if getattr(request, "aspect_ratio", None):
+        ar_val = str(getattr(request, "aspect_ratio")).strip()
+        if ar_val and not _is_aspect_ratio(ar_val):
+            raise ValidationException(
+                message=f"aspect_ratio must be one of {sorted(ALLOWED_ASPECT_RATIOS)}",
+                param="aspect_ratio",
+                code="invalid_aspect_ratio",
+            )
 
 
 def validate_generation_request(request: ImageGenerationRequest):
@@ -296,10 +394,15 @@ async def create_image(request: ImageGenerationRequest):
     response_format = resolve_response_format(request.response_format)
     response_field = response_field_name(response_format)
 
+    # Normalize size/aspect ratio (compat: accept aspectRatio and ratio-like size)
+    normalized_size, aspect_ratio = _normalize_size_and_aspect(
+        size=request.size,
+        aspect_ratio=request.aspect_ratio,
+    )
+
     # 获取 token 和模型信息
     token_mgr, token = await _get_token(request.model)
     model_info = ModelService.get(request.model)
-    aspect_ratio = resolve_aspect_ratio(request.size)
 
     result = await ImageGenerationService().generate(
         token_mgr=token_mgr,
@@ -308,7 +411,7 @@ async def create_image(request: ImageGenerationRequest):
         prompt=request.prompt,
         n=request.n,
         response_format=response_format,
-        size=request.size,
+        size=normalized_size,
         aspect_ratio=aspect_ratio,
         stream=bool(request.stream),
     )
@@ -344,11 +447,13 @@ async def edit_image(request: Request):
 
     同官方 API 格式，仅支持 multipart/form-data 文件上传。
     兼容 'image' 和 'image[]' 两种字段名，支持单图和多图上传。
+
+    兼容额外字段:
+    - aspect_ratio / aspectRatio: 9:16, 16:9 ... (优先级高于 size)
+    - size 也支持直接传比例字符串，例如 size=9:16
     """
     # ------------------------------------------------------------------
     # 1. 手动解析 multipart form data
-    #    FastAPI 的 File(...) 只认固定字段名，无法同时兼容 image / image[]，
-    #    所以改用 request.form() 手动提取。
     # ------------------------------------------------------------------
     form = await request.form()
 
@@ -365,6 +470,13 @@ async def edit_image(request: Request):
     model = str(form.get("model", "grok-imagine-1.0-edit"))
     n = int(form.get("n", 1))
     size = str(form.get("size", "1024x1024"))
+
+    # Compatibility: accept aspect_ratio/aspectRatio in multipart
+    aspect_ratio_raw = form.get("aspect_ratio")
+    if aspect_ratio_raw is None:
+        aspect_ratio_raw = form.get("aspectRatio")
+    aspect_ratio_val = str(aspect_ratio_raw).strip() if aspect_ratio_raw else None
+
     quality = str(form.get("quality", "standard"))
     response_format_raw = form.get("response_format")
     response_format_val = str(response_format_raw) if response_format_raw else None
@@ -379,16 +491,12 @@ async def edit_image(request: Request):
 
     # ------------------------------------------------------------------
     # 提取上传的图片文件 —— 兼容多种字段名
-    # 使用鸭子类型 (_is_upload_file) 代替 isinstance(v, UploadFile)，
-    # 因为 FastAPI 和 Starlette 的 UploadFile 可能是不同的类对象。
     # ------------------------------------------------------------------
     uploaded_files = []
     for key in form:
         if key in _IMAGE_FIELD_NAMES:
             values = form.getlist(key)
-            logger.debug(
-                f"Found image field {key!r} with {len(values)} item(s)"
-            )
+            logger.debug(f"Found image field {key!r} with {len(values)} item(s)")
             for v in values:
                 if _is_upload_file(v):
                     uploaded_files.append(v)
@@ -412,6 +520,7 @@ async def edit_image(request: Request):
             model=model,
             n=n,
             size=size,
+            aspect_ratio=aspect_ratio_val,
             quality=quality,
             response_format=response_format_val,
             style=style,
@@ -443,8 +552,11 @@ async def edit_image(request: Request):
     # 参数验证
     validate_edit_request(edit_request, uploaded_files)
 
-    # Resolve aspect ratio from size for image edits
-    aspect_ratio = resolve_aspect_ratio(edit_request.size)
+    # Normalize size/aspect ratio (compat: accept aspectRatio and ratio-like size)
+    normalized_size, aspect_ratio = _normalize_size_and_aspect(
+        size=edit_request.size,
+        aspect_ratio=edit_request.aspect_ratio,
+    )
 
     # ------------------------------------------------------------------
     # 3. 读取并验证图片内容
