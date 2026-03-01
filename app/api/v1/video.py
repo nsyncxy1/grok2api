@@ -21,6 +21,7 @@ from app.core.exceptions import AppException, ErrorType, ValidationException
 from app.core.logger import logger
 from app.services.grok.services.model import ModelService
 from app.services.grok.services.video import VideoService
+from app.services.grok.utils.download import DownloadService
 from app.services.grok.utils.upload import UploadService
 from app.services.token import get_token_manager
 from app.services.token.manager import BASIC_POOL_NAME
@@ -37,22 +38,6 @@ _TASK_TTL_SECONDS = 3600  # Auto-expire completed tasks after 1 hour
 
 # Maximum reference images for video generation
 _MAX_VIDEO_REFERENCE_IMAGES = 3
-
-_GROK_ASSETS_BASE = "https://assets.grok.com/"
-
-
-def _ensure_full_url(url: str) -> str:
-    """Ensure Grok asset URL is a full URL, not a relative path."""
-    if not url:
-        return url
-    # Already a full URL
-    if url.startswith("http://") or url.startswith("https://"):
-        return url
-    # data: URI — pass through
-    if url.startswith("data:"):
-        return url
-    # Relative path from Grok (e.g. "users/.../generated_video.mp4")
-    return f"{_GROK_ASSETS_BASE}{url}"
 
 
 def _cleanup_expired() -> None:
@@ -186,9 +171,22 @@ async def _run_video_task(task_id: str, params: Dict[str, Any]) -> None:
             except Exception as e:
                 logger.warning(f"[VideoTask {task_id}] Upscale failed: {e}")
 
-        # ---- Ensure full URLs ------------------------------------------------
-        video_url = _ensure_full_url(video_url)
-        thumbnail_url = _ensure_full_url(thumbnail_url)
+        # ---- Resolve URLs via DownloadService (same as chat/completions) -----
+        # This ensures the video URL is accessible to the client:
+        # - If app_url is configured: downloads asset and returns local proxy URL
+        # - Otherwise: returns the assets.grok.com URL (requires token auth)
+        if video_url:
+            dl_service = DownloadService()
+            try:
+                video_url = await dl_service.resolve_url(video_url, token, "video")
+                logger.info(f"[VideoTask {task_id}] Resolved video URL: {video_url}")
+                if thumbnail_url:
+                    thumbnail_url = await dl_service.resolve_url(thumbnail_url, token, "image")
+            except Exception as e:
+                logger.warning(f"[VideoTask {task_id}] URL resolve failed: {e}")
+                # Fallback: keep the raw URL as-is
+            finally:
+                await dl_service.close()
 
         if video_url:
             _tasks[task_id].update(
