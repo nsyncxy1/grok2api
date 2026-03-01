@@ -213,7 +213,7 @@ def _extract_aspect_ratio_from_prompt(prompt: str) -> Optional[str]:
     match = re.search(pattern, normalized)
 
     logger.debug(
-        "[aspect] extract from prompt: raw=%r normalized=%r pattern=%r matched=%s",
+        "[aspect] extract from prompt: raw={} normalized={} pattern={} matched={}",
         _truncate_for_log(prompt, max_len=2000),
         _truncate_for_log(normalized, max_len=2000),
         pattern,
@@ -228,7 +228,7 @@ def _extract_aspect_ratio_from_prompt(prompt: str) -> Optional[str]:
     token = re.sub(sep, ":", token)
 
     logger.debug(
-        "[aspect] match: raw_token=%r cleaned_token=%r span=%s",
+        "[aspect] match: raw_token={} cleaned_token={} span={}",
         raw_token,
         token,
         match.span(1),
@@ -236,10 +236,13 @@ def _extract_aspect_ratio_from_prompt(prompt: str) -> Optional[str]:
 
     if _is_aspect_ratio(token):
         resolved = resolve_aspect_ratio(token)
-        logger.debug("[aspect] resolved aspect_ratio=%r", resolved)
+        logger.debug("[aspect] resolved aspect_ratio={}", resolved)
         return resolved
 
-    logger.debug("[aspect] cleaned token is not in allowed aspect ratios: %r", token)
+    logger.debug(
+        "[aspect] cleaned token is not in allowed aspect ratios: {}",
+        token,
+    )
     return None
 
 
@@ -560,6 +563,42 @@ async def edit_image(request: Request):
     - size 也支持直接传比例字符串，例如 size=9:16
     """
     # ------------------------------------------------------------------
+    # 0) 打印原始 body 预览（用于排查客户端实际发送了什么）
+    # 注意：multipart body 里包含二进制图片，不能全量打印；这里只打印长度 + 前缀预览。
+    # 先读取 body 再解析 form，确保还能解析 multipart。
+    # ------------------------------------------------------------------
+    raw_body = b""
+    try:
+        raw_body = await request.body()
+        ct = request.headers.get("content-type")
+        logger.info(
+            "[/v1/images/edits] raw body: content_length={} bytes_read={} content_type={}",
+            request.headers.get("content-length"),
+            len(raw_body),
+            ct,
+        )
+
+        # 仅打印前缀，避免日志爆炸/泄露整张图
+        preview = raw_body[:2048]
+        try:
+            preview_text = preview.decode("utf-8", errors="replace")
+        except Exception:
+            preview_text = "<decode_failed>"
+
+        logger.info(
+            "[/v1/images/edits] raw body preview (first {} bytes) as bytes(repr)={} ",
+            len(preview),
+            repr(preview),
+        )
+        logger.info(
+            "[/v1/images/edits] raw body preview (first {} bytes) as utf8(replace)={}",
+            len(preview),
+            _truncate_for_log(preview_text, max_len=2000),
+        )
+    except Exception:
+        logger.exception("[/v1/images/edits] failed to read/log raw body")
+
+    # ------------------------------------------------------------------
     # 1. 手动解析 multipart form data
     # ------------------------------------------------------------------
     form = await request.form()
@@ -576,7 +615,7 @@ async def edit_image(request: Request):
             if k.lower() not in sensitive_headers
         }
         logger.info(
-            "[/v1/images/edits] incoming request: content-type=%r query=%s headers=%s",
+            "[/v1/images/edits] incoming request: content-type={} query={} headers={}",
             request.headers.get("content-type"),
             dict(request.query_params),
             safe_headers,
@@ -607,7 +646,7 @@ async def edit_image(request: Request):
                         "len": len(str(v)) if v is not None else 0,
                     }
                 )
-        logger.info("[/v1/images/edits] multipart fields=%s", field_summaries)
+        logger.info("[/v1/images/edits] multipart fields={}", field_summaries)
     except Exception:
         logger.exception("[/v1/images/edits] failed to summarize multipart fields")
 
@@ -653,8 +692,8 @@ async def edit_image(request: Request):
         stream = stream_str in ("true", "1", "yes")
 
     logger.info(
-        "[/v1/images/edits] parsed fields: model=%r n=%r size_raw=%r resolution_raw=%r "
-        "has_size_field=%r aspect_ratio_raw=%r response_format=%r stream_raw=%r",
+        "[/v1/images/edits] parsed fields: model={} n={} size_raw={} resolution_raw={} "
+        "has_size_field={} aspect_ratio_raw={} response_format={} stream_raw={}",
         model,
         n,
         size_raw,
@@ -665,7 +704,7 @@ async def edit_image(request: Request):
         stream_raw,
     )
     # Use repr to expose invisible characters in prompt
-    logger.info("[/v1/images/edits] prompt(repr)=%r", prompt)
+    logger.info("[/v1/images/edits] prompt(repr)={}", repr(prompt))
 
     # ------------------------------------------------------------------
     # 提取上传的图片文件 —— 兼容多种字段名
@@ -674,18 +713,19 @@ async def edit_image(request: Request):
     for key in form:
         if key in _IMAGE_FIELD_NAMES:
             values = form.getlist(key)
-            logger.debug(f"Found image field {key!r} with {len(values)} item(s)")
+            logger.debug("Found image field {} with {} item(s)", repr(key), len(values))
             for v in values:
                 if _is_upload_file(v):
                     uploaded_files.append(v)
                 else:
                     logger.warning(
-                        f"Skipping non-file value in field {key!r}: "
-                        f"type={type(v).__name__}"
+                        "Skipping non-file value in field {}: type={}",
+                        repr(key),
+                        type(v).__name__,
                     )
 
     logger.info(
-        "[/v1/images/edits] collected %d uploaded image(s): %s",
+        "[/v1/images/edits] collected {} uploaded image(s): {}",
         len(uploaded_files),
         [
             {
@@ -785,9 +825,9 @@ async def edit_image(request: Request):
                 )
 
         logger.info(
-            "[/v1/images/edits] read upload: filename=%r content_type=%r bytes=%d",
-            item.filename,
-            item.content_type,
+            "[/v1/images/edits] read upload: filename={} content_type={} bytes={}",
+            repr(item.filename),
+            repr(item.content_type),
             len(content),
         )
 
@@ -807,8 +847,8 @@ async def edit_image(request: Request):
         normalize_aspect_input = extracted_from_prompt
 
     logger.info(
-        "[/v1/images/edits] aspect normalization: explicit_aspect=%r extracted_from_prompt=%r "
-        "normalize_size_input=%r",
+        "[/v1/images/edits] aspect normalization: explicit_aspect={} extracted_from_prompt={} "
+        "normalize_size_input={}",
         edit_request.aspect_ratio,
         extracted_from_prompt,
         normalize_size_input,
@@ -828,7 +868,7 @@ async def edit_image(request: Request):
         )
 
     logger.info(
-        "[/v1/images/edits] normalized: size=%r aspect_ratio=%r",
+        "[/v1/images/edits] normalized: size={} aspect_ratio={}",
         normalized_size,
         aspect_ratio,
     )
