@@ -73,13 +73,7 @@ class ImageEditService:
         aspect_ratio: Optional[str] = None,
     ) -> ImageEditResult:
         logger.info(
-            "[aspect-ratio-trace] image_edit.enter model=%s n=%s images=%s stream=%s response_format=%s requested_aspect_ratio=%s",
-            (model_info.model_id if model_info else "unknown"),
-            n,
-            len(images),
-            stream,
-            response_format,
-            aspect_ratio,
+            f"[aspect-ratio-trace] image_edit.enter model={(model_info.model_id if model_info else 'unknown')} n={n} images={len(images)} stream={stream} response_format={response_format} requested_aspect_ratio={aspect_ratio}"
         )
 
         if len(images) > 3:
@@ -142,17 +136,12 @@ class ImageEditService:
                     model_config_override
                 )
                 logger.info(
-                    "[aspect-ratio-trace] image_edit.override model=%s image_refs=%s parent_post=%s effective_aspect_ratio=%s",
-                    (model_info.model_id if model_info else "unknown"),
-                    len(image_urls),
-                    bool(parent_post_id),
-                    effective_aspect_ratio,
+                    f"[aspect-ratio-trace] image_edit.override model={(model_info.model_id if model_info else 'unknown')} image_refs={len(image_urls)} parent_post={bool(parent_post_id)} effective_aspect_ratio={effective_aspect_ratio}"
                 )
 
                 if stream:
                     logger.info(
-                        "[aspect-ratio-trace] image_edit.chat_call stream=True effective_aspect_ratio=%s",
-                        effective_aspect_ratio,
+                        f"[aspect-ratio-trace] image_edit.chat_call stream=True effective_aspect_ratio={effective_aspect_ratio}"
                     )
                     response = await GrokChatService().chat(
                         token=current_token,
@@ -310,11 +299,7 @@ class ImageEditService:
         calls_needed = (n + 1) // 2
         effective_aspect_ratio = _extract_effective_aspect_ratio(model_config_override)
         logger.info(
-            "[aspect-ratio-trace] image_edit.collect model=%s calls_needed=%s requested_n=%s effective_aspect_ratio=%s",
-            (model_info.model_id if model_info else "unknown"),
-            calls_needed,
-            n,
-            effective_aspect_ratio,
+            f"[aspect-ratio-trace] image_edit.collect model={(model_info.model_id if model_info else 'unknown')} calls_needed={calls_needed} requested_n={n} effective_aspect_ratio={effective_aspect_ratio}"
         )
 
         async def _call_edit():

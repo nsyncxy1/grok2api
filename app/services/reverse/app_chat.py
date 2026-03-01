@@ -166,13 +166,20 @@ class AppChatReverse:
 
             payload_aspect_ratio = _extract_aspect_ratio_from_payload(payload)
             logger.info(
-                "[aspect-ratio-trace] app_chat.request model=%s mode=%s has_model_config_override=%s payload_aspect_ratio=%s attachments=%s",
-                model,
-                mode,
-                bool(model_config_override),
-                payload_aspect_ratio,
-                len(file_attachments or []),
+                f"[aspect-ratio-trace] app_chat.request model={model} mode={mode} has_model_config_override={bool(model_config_override)} payload_aspect_ratio={payload_aspect_ratio} attachments={len(file_attachments or [])}"
             )
+            if model_config_override:
+                try:
+                    compact = orjson.dumps(model_config_override).decode()
+                    if len(compact) > 2000:
+                        compact = compact[:2000] + "...<truncated>"
+                    logger.info(
+                        f"[aspect-ratio-trace] app_chat.model_config_override={compact}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[aspect-ratio-trace] app_chat.model_config_override serialize_failed error={e}"
+                    )
 
             # Curl Config
             timeout = float(get_config("chat.timeout") or 0)
@@ -204,10 +211,7 @@ class AppChatReverse:
                     except Exception:
                         pass
 
-                    logger.debug(
-                        "AppChatReverse: Chat failed response body: %s",
-                        content,
-                    )
+                    logger.debug(f"AppChatReverse: Chat failed response body: {content}")
                     logger.error(
                         f"AppChatReverse: Chat failed, {response.status_code}",
                         extra={"error_type": "UpstreamException"},

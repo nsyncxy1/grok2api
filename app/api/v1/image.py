@@ -4,7 +4,6 @@ Image Generation API 路由
 
 import base64
 import time
-import logging
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -18,8 +17,7 @@ from app.services.grok.services.model import ModelService
 from app.services.token import get_token_manager
 from app.core.exceptions import ValidationException, AppException, ErrorType
 from app.core.config import get_config
-
-logger = logging.getLogger(__name__)
+from app.core.logger import logger
 
 router = APIRouter(tags=["Images"])
 
@@ -395,12 +393,7 @@ async def create_image(request: ImageGenerationRequest):
     response_field = response_field_name(response_format)
 
     logger.info(
-        "[aspect-ratio-trace] image_gen.request model=%s size=%s aspect_ratio=%s n=%s stream=%s",
-        request.model,
-        request.size,
-        request.aspect_ratio,
-        request.n,
-        request.stream,
+        f"[aspect-ratio-trace] image_gen.request model={request.model} size={request.size} aspect_ratio={request.aspect_ratio} n={request.n} stream={request.stream}"
     )
 
     # Normalize size/aspect ratio (compat: accept aspectRatio and ratio-like size)
@@ -410,10 +403,7 @@ async def create_image(request: ImageGenerationRequest):
     )
 
     logger.info(
-        "[aspect-ratio-trace] image_gen.normalized model=%s normalized_size=%s normalized_aspect_ratio=%s",
-        request.model,
-        normalized_size,
-        aspect_ratio,
+        f"[aspect-ratio-trace] image_gen.normalized model={request.model} normalized_size={normalized_size} normalized_aspect_ratio={aspect_ratio}"
     )
 
     # 获取 token 和模型信息
@@ -494,12 +484,10 @@ async def edit_image(request: Request):
     aspect_ratio_val = str(aspect_ratio_raw).strip() if aspect_ratio_raw else None
 
     logger.info(
-        "[aspect-ratio-trace] image_edit.form model=%s raw_size=%s raw_aspect_ratio=%s raw_aspectRatio=%s n=%s",
-        model,
-        size,
-        form.get("aspect_ratio"),
-        form.get("aspectRatio"),
-        n,
+        f"[aspect-ratio-trace] image_edit.form_keys keys={list(form.keys())}"
+    )
+    logger.info(
+        f"[aspect-ratio-trace] image_edit.form model={model} raw_size={size} raw_aspect_ratio={form.get('aspect_ratio')} raw_aspectRatio={form.get('aspectRatio')} n={n}"
     )
 
     quality = str(form.get("quality", "standard"))
@@ -584,12 +572,7 @@ async def edit_image(request: Request):
     )
 
     logger.info(
-        "[aspect-ratio-trace] image_edit.normalized model=%s normalized_size=%s normalized_aspect_ratio=%s request_size=%s request_aspect_ratio=%s",
-        edit_request.model,
-        normalized_size,
-        aspect_ratio,
-        edit_request.size,
-        edit_request.aspect_ratio,
+        f"[aspect-ratio-trace] image_edit.normalized model={edit_request.model} normalized_size={normalized_size} normalized_aspect_ratio={aspect_ratio} request_size={edit_request.size} request_aspect_ratio={edit_request.aspect_ratio}"
     )
 
     # ------------------------------------------------------------------
