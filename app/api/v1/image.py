@@ -165,18 +165,40 @@ def _normalize_size_and_aspect(*, size: Optional[str], aspect_ratio: Optional[st
     return size_val, ar
 
 
+def _truncate_for_log(value: object, *, max_len: int = 2000) -> str:
+    """Convert value to string safely and truncate for logging."""
+    if value is None:
+        return "<None>"
+    try:
+        s = str(value)
+    except Exception:
+        return f"<{type(value).__name__}>"
+    if len(s) > max_len:
+        return s[:max_len] + "...<truncated>"
+    return s
+
+
 def _extract_aspect_ratio_from_prompt(prompt: str) -> Optional[str]:
     """Extract allowed aspect ratio from prompt text via regex.
 
     Supports patterns like:
-    - 9:16, 9：16, 9∶16
+    - 9:16, 9：16, 9∶16, ９：１６ (full-width digits)
     - 9/16
     - 9x16, 9X16, 9×16
+
+    This function prints DEBUG logs to diagnose extraction failures.
     """
     if not prompt:
+        logger.debug("[aspect] prompt is empty")
         return None
 
     normalized = str(prompt)
+
+    # Normalize full-width digits (０-９) to ASCII (0-9)
+    normalized = normalized.translate(
+        str.maketrans("０１２３４５６７８９", "0123456789")
+    )
+
     # normalize common separators
     normalized = (
         normalized.replace("：", ":")
@@ -189,14 +211,35 @@ def _extract_aspect_ratio_from_prompt(prompt: str) -> Optional[str]:
     pattern = rf"(?<!\d)(1\s*{sep}\s*1|2\s*{sep}\s*3|3\s*{sep}\s*2|9\s*{sep}\s*16|16\s*{sep}\s*9)(?!\d)"
 
     match = re.search(pattern, normalized)
+
+    logger.debug(
+        "[aspect] extract from prompt: raw=%r normalized=%r pattern=%r matched=%s",
+        _truncate_for_log(prompt, max_len=2000),
+        _truncate_for_log(normalized, max_len=2000),
+        pattern,
+        bool(match),
+    )
+
     if not match:
         return None
 
-    token = re.sub(r"\s+", "", match.group(1))
+    raw_token = match.group(1)
+    token = re.sub(r"\s+", "", raw_token)
     token = re.sub(sep, ":", token)
 
+    logger.debug(
+        "[aspect] match: raw_token=%r cleaned_token=%r span=%s",
+        raw_token,
+        token,
+        match.span(1),
+    )
+
     if _is_aspect_ratio(token):
-        return resolve_aspect_ratio(token)
+        resolved = resolve_aspect_ratio(token)
+        logger.debug("[aspect] resolved aspect_ratio=%r", resolved)
+        return resolved
+
+    logger.debug("[aspect] cleaned token is not in allowed aspect ratios: %r", token)
     return None
 
 
@@ -525,14 +568,17 @@ async def edit_image(request: Request):
     # 1.1 打印请求内容（用于排查 prompt 中比例提取失败等问题）
     # ------------------------------------------------------------------
     try:
-        # Avoid leaking secrets (api keys, auth headers)
-        sensitive_headers = {"authorization", "x-api-key"}
+        # Avoid leaking secrets (api keys, auth headers, cookies)
+        sensitive_headers = {"authorization", "x-api-key", "cookie"}
         safe_headers = {
-            k: v for k, v in request.headers.items() if k.lower() not in sensitive_headers
+            k: v
+            for k, v in request.headers.items()
+            if k.lower() not in sensitive_headers
         }
         logger.info(
-            "[/v1/images/edits] incoming request: content-type=%r headers=%s",
+            "[/v1/images/edits] incoming request: content-type=%r query=%s headers=%s",
             request.headers.get("content-type"),
+            dict(request.query_params),
             safe_headers,
         )
     except Exception:
@@ -552,13 +598,13 @@ async def edit_image(request: Request):
                     }
                 )
             else:
-                sv = str(v)
+                sv = _truncate_for_log(v, max_len=1000)
                 field_summaries.append(
                     {
                         "key": k,
                         "type": "text",
-                        "value": (sv[:500] + "...<truncated>") if len(sv) > 500 else sv,
-                        "len": len(sv),
+                        "value": sv,
+                        "len": len(str(v)) if v is not None else 0,
                     }
                 )
         logger.info("[/v1/images/edits] multipart fields=%s", field_summaries)
@@ -662,7 +708,9 @@ async def edit_image(request: Request):
             model=model,
             n=n,
             size=size,
-            resolution=str(resolution_raw).strip() if resolution_raw is not None else None,
+            resolution=str(resolution_raw).strip()
+            if resolution_raw is not None
+            else None,
             aspect_ratio=aspect_ratio_val,
             quality=quality,
             response_format=response_format_val,
