@@ -63,7 +63,7 @@ class ImageEditService:
 
         if len(images) > 3:
             logger.info(
-                "Image edit received %d references; using the most recent 3",
+                "Image edit received {} references; using the most recent 3",
                 len(images),
             )
             images = images[-3:]
@@ -118,12 +118,16 @@ class ImageEditService:
                 tool_overrides = {"imageGen": True}
 
                 logger.info(
-                    "[image_edit] sending to grok: aspect_ratio=%s n=%d image_count=%d parent_post_id=%s model=%s",
-                    aspect_ratio,
-                    n,
-                    len(image_urls),
-                    parent_post_id,
+                    "[image_edit] sending to grok: aspect_ratio={} n={} image_count={} "
+                    "parent_post_id={} model={}",
+                    aspect_ratio, n, len(image_urls), parent_post_id,
                     model_info.grok_model,
+                )
+                # Log the full model_config_override so we can verify
+                # what's actually being sent to grok (especially aspectRatio)
+                logger.info(
+                    "[image_edit] model_config_override={}",
+                    orjson.dumps(model_config_override).decode(),
                 )
 
                 if stream:
@@ -170,10 +174,10 @@ class ImageEditService:
                     )
                     await token_mgr.consume(current_token, effort)
                     logger.debug(
-                        f"Image edit completed, recorded usage (effort={effort.value})"
+                        "Image edit completed, recorded usage (effort={})", effort.value
                     )
                 except Exception as e:
-                    logger.warning(f"Failed to record image edit usage: {e}")
+                    logger.warning("Failed to record image edit usage: {}", e)
                 return ImageEditResult(stream=False, data=images_out)
 
             except UpstreamException as e:
@@ -181,8 +185,9 @@ class ImageEditService:
                 if rate_limited(e):
                     await token_mgr.mark_rate_limited(current_token)
                     logger.warning(
-                        f"Token {current_token[:10]}... rate limited (429), "
-                        f"trying next token (attempt {attempt + 1}/{max_token_retries})"
+                        "Token {}... rate limited (429), "
+                        "trying next token (attempt {}/{})",
+                        current_token[:10], attempt + 1, max_token_retries,
                     )
                     continue
                 raise
@@ -212,7 +217,7 @@ class ImageEditService:
                             )
                 except Exception as e:
                     logger.warning(
-                        f"Failed to upload image {idx + 1}/{len(images)}: {e}"
+                        "Failed to upload image {}/{}: {}", idx + 1, len(images), e
                     )
         finally:
             await upload_service.close()
@@ -235,14 +240,14 @@ class ImageEditService:
             try:
                 post_id = await media_service.create_image_post(token, url)
                 logger.debug(
-                    f"Created image post {idx + 1}/{len(image_urls)}: {post_id}"
+                    "Created image post {}/{}: {}", idx + 1, len(image_urls), post_id
                 )
                 if not parent_post_id:
                     parent_post_id = post_id
             except Exception as e:
                 logger.warning(
-                    f"Create image post failed for image {idx + 1}/{len(image_urls)} "
-                    f"({url[:80]}): {e}"
+                    "Create image post failed for image {}/{} ({}): {}",
+                    idx + 1, len(image_urls), url[:80], e,
                 )
 
         if parent_post_id:
@@ -301,7 +306,7 @@ class ImageEditService:
             all_images: List[str] = []
             for result in results:
                 if isinstance(result, Exception):
-                    logger.error(f"Concurrent call failed: {result}")
+                    logger.error("Concurrent call failed: {}", result)
                     last_error = result
                     if rate_limited(result):
                         rate_limit_error = result
@@ -339,17 +344,17 @@ def _log_model_response_meta(tag: str, mr: dict):
     w = mr.get("generatedImageWidth")
     h = mr.get("generatedImageHeight")
     if w or h:
-        logger.info("[%s] grok returned dimensions: %sx%s", tag, w, h)
+        logger.info("[{}] grok returned dimensions: {}x{}", tag, w, h)
 
     # imageEditUris — grok edit-specific field
     edit_uris = mr.get("imageEditUris")
     if edit_uris:
-        logger.info("[%s] grok imageEditUris: %s", tag, edit_uris)
+        logger.info("[{}] grok imageEditUris: {}", tag, edit_uris)
 
     # mediaTypes
     media_types = mr.get("mediaTypes")
     if media_types:
-        logger.info("[%s] grok mediaTypes: %s", tag, media_types)
+        logger.info("[{}] grok mediaTypes: {}", tag, media_types)
 
 
 class ImageStreamProcessor(BaseProcessor):
@@ -429,7 +434,7 @@ class ImageStreamProcessor(BaseProcessor):
 
                     urls = _collect_images(mr)
                     logger.info(
-                        "[image_edit_stream] collected %d image URL(s) (n=%d)",
+                        "[image_edit_stream] collected {} image URL(s) (n={})",
                         len(urls), self.n,
                     )
 
@@ -437,12 +442,12 @@ class ImageStreamProcessor(BaseProcessor):
                         # Log message if grok returned text instead of images
                         if msg := mr.get("message"):
                             logger.warning(
-                                "[image_edit_stream] grok returned text instead of images: %s",
+                                "[image_edit_stream] grok returned text instead of images: {}",
                                 _truncate(str(msg), 500),
                             )
                         else:
                             logger.warning(
-                                "[image_edit_stream] modelResponse has NO image URLs! keys=%s",
+                                "[image_edit_stream] modelResponse has NO image URLs! keys={}",
                                 list(mr.keys()),
                             )
                         continue
@@ -451,7 +456,7 @@ class ImageStreamProcessor(BaseProcessor):
                     urls_to_use = urls[:self.n]
                     if len(urls) > self.n:
                         logger.info(
-                            "[image_edit_stream] grok returned %d images but n=%d, using first %d",
+                            "[image_edit_stream] grok returned {} images but n={}, using first {}",
                             len(urls), self.n, self.n,
                         )
 
@@ -473,17 +478,17 @@ class ImageStreamProcessor(BaseProcessor):
                                     b64 = base64_data
                                 final_images.append(b64)
                                 logger.info(
-                                    "[image_edit_stream] downloaded image: b64_len=%d",
+                                    "[image_edit_stream] downloaded image: b64_len={}",
                                     len(b64),
                                 )
                             else:
                                 logger.warning(
-                                    "[image_edit_stream] parse_b64 returned empty for url=%s",
+                                    "[image_edit_stream] parse_b64 returned empty for url={}",
                                     url[:80],
                                 )
                         except Exception as e:
                             logger.warning(
-                                "[image_edit_stream] b64 download failed (url=%s): %s, falling back to URL",
+                                "[image_edit_stream] b64 download failed (url={}): {}, falling back to URL",
                                 url[:80], e,
                             )
                             processed = await self.process_url(url, "image")
@@ -492,7 +497,7 @@ class ImageStreamProcessor(BaseProcessor):
                     continue
 
             logger.info(
-                "[image_edit_stream] stream ended: total_lines=%d final_images=%d (n=%d)",
+                "[image_edit_stream] stream ended: total_lines={} final_images={} (n={})",
                 line_count, len(final_images), self.n,
             )
 
@@ -566,7 +571,7 @@ class ImageStreamProcessor(BaseProcessor):
 
             if not output_images:
                 logger.error(
-                    "[image_edit_stream] FAILED: no images produced after %d lines from grok",
+                    "[image_edit_stream] FAILED: no images produced after {} lines from grok",
                     line_count,
                 )
 
@@ -584,13 +589,13 @@ class ImageStreamProcessor(BaseProcessor):
             )
         except RequestsError as e:
             if _is_http2_error(e):
-                logger.warning(f"HTTP/2 stream error in image: {e}")
+                logger.warning("HTTP/2 stream error in image: {}", e)
                 raise UpstreamException(
                     message="Upstream connection closed unexpectedly",
                     status_code=502,
                     details={"error": str(e), "type": "http2_stream_error"},
                 )
-            logger.error(f"Image stream request error: {e}")
+            logger.error("Image stream request error: {}", e)
             raise UpstreamException(
                 message=f"Upstream request failed: {e}",
                 status_code=502,
@@ -598,7 +603,8 @@ class ImageStreamProcessor(BaseProcessor):
             )
         except Exception as e:
             logger.error(
-                f"Image stream processing error: {e}",
+                "Image stream processing error: {}",
+                e,
                 extra={"error_type": type(e).__name__},
             )
             raise
@@ -642,19 +648,19 @@ class ImageCollectProcessor(BaseProcessor):
 
                     urls = _collect_images(mr)
                     logger.info(
-                        "[image_edit_collect] collected %d image URL(s) (n=%d)",
+                        "[image_edit_collect] collected {} image URL(s) (n={})",
                         len(urls), self.n,
                     )
 
                     if not urls:
                         if msg := mr.get("message"):
                             logger.warning(
-                                "[image_edit_collect] grok returned text instead of images: %s",
+                                "[image_edit_collect] grok returned text instead of images: {}",
                                 _truncate(str(msg), 500),
                             )
                         else:
                             logger.warning(
-                                "[image_edit_collect] modelResponse has NO image URLs! keys=%s",
+                                "[image_edit_collect] modelResponse has NO image URLs! keys={}",
                                 list(mr.keys()),
                             )
                         continue
@@ -663,7 +669,7 @@ class ImageCollectProcessor(BaseProcessor):
                     urls_to_use = urls[:self.n]
                     if len(urls) > self.n:
                         logger.info(
-                            "[image_edit_collect] grok returned %d images but n=%d, using first %d",
+                            "[image_edit_collect] grok returned {} images but n={}, using first {}",
                             len(urls), self.n, self.n,
                         )
 
@@ -687,34 +693,35 @@ class ImageCollectProcessor(BaseProcessor):
                                     b64 = base64_data
                                 images.append(b64)
                                 logger.info(
-                                    "[image_edit_collect] downloaded image: b64_len=%d",
+                                    "[image_edit_collect] downloaded image: b64_len={}",
                                     len(b64),
                                 )
                         except Exception as e:
                             logger.warning(
-                                f"Failed to convert image to base64, falling back to URL: {e}"
+                                "Failed to convert image to base64, falling back to URL: {}", e
                             )
                             processed = await self.process_url(url, "image")
                             if processed:
                                 images.append(processed)
 
             logger.info(
-                "[image_edit_collect] done: total_lines=%d images=%d (n=%d)",
+                "[image_edit_collect] done: total_lines={} images={} (n={})",
                 line_count, len(images), self.n,
             )
 
         except asyncio.CancelledError:
             logger.debug("Image collect cancelled by client")
         except StreamIdleTimeoutError as e:
-            logger.warning(f"Image collect idle timeout: {e}")
+            logger.warning("Image collect idle timeout: {}", e)
         except RequestsError as e:
             if _is_http2_error(e):
-                logger.warning(f"HTTP/2 stream error in image collect: {e}")
+                logger.warning("HTTP/2 stream error in image collect: {}", e)
             else:
-                logger.error(f"Image collect request error: {e}")
+                logger.error("Image collect request error: {}", e)
         except Exception as e:
             logger.error(
-                f"Image collect processing error: {e}",
+                "Image collect processing error: {}",
+                e,
                 extra={"error_type": type(e).__name__},
             )
         finally:
