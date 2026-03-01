@@ -5,7 +5,7 @@ Grok video generation service.
 import asyncio
 import uuid
 import re
-from typing import Any, AsyncGenerator, AsyncIterable, Optional
+from typing import Any, AsyncGenerator, AsyncIterable, List, Optional
 
 import orjson
 from curl_cffi.requests.errors import RequestsError
@@ -37,6 +37,9 @@ from app.services.token.manager import BASIC_POOL_NAME
 
 _VIDEO_SEMAPHORE = None
 _VIDEO_SEM_VALUE = 0
+
+# Maximum number of reference images supported by Grok for video generation
+_MAX_VIDEO_REFERENCE_IMAGES = 3
 
 def _get_video_semaphore() -> asyncio.Semaphore:
     """Reverse 接口并发控制（video 服务）。"""
@@ -105,6 +108,38 @@ class VideoService:
             token, prompt="", media_type="MEDIA_POST_TYPE_IMAGE", media_url=image_url
         )
 
+    async def create_image_posts(self, token: str, image_urls: List[str]) -> str:
+        """Create media posts for ALL reference images and return the first post ID.
+
+        The Grok backend requires every image referenced in the request
+        to have a corresponding media post.
+
+        Args:
+            token: SSO token.
+            image_urls: List of image URLs to create posts for (max 3).
+
+        Returns:
+            The first successfully created post ID, or empty string on failure.
+        """
+        parent_post_id = None
+
+        for idx, url in enumerate(image_urls):
+            try:
+                post_id = await self.create_image_post(token, url)
+                logger.debug(
+                    f"Created image post {idx + 1}/{len(image_urls)}: {post_id}"
+                )
+                # Use the first successfully created post ID as parentPostId
+                if not parent_post_id:
+                    parent_post_id = post_id
+            except Exception as e:
+                logger.warning(
+                    f"Create image post failed for image {idx + 1}/{len(image_urls)} "
+                    f"({url[:80]}): {e}"
+                )
+
+        return parent_post_id or ""
+
     async def generate(
         self,
         token: str,
@@ -164,21 +199,38 @@ class VideoService:
 
         return _stream()
 
-    async def generate_from_image(
+    async def generate_from_images(
         self,
         token: str,
         prompt: str,
-        image_url: str,
+        image_urls: List[str],
         aspect_ratio: str = "3:2",
         video_length: int = 6,
         resolution: str = "480p",
         preset: str = "normal",
     ) -> AsyncGenerator[bytes, None]:
-        """Generate video from image."""
+        """Generate video from one or more reference images (up to 3).
+
+        Args:
+            token: SSO token.
+            prompt: Text prompt for video generation.
+            image_urls: List of uploaded image URLs (max 3).
+            aspect_ratio: Video aspect ratio.
+            video_length: Video duration in seconds.
+            resolution: Video resolution name.
+            preset: Style preset.
+        """
         logger.info(
-            f"Image to video: prompt='{prompt[:50]}...', image={image_url[:80]}"
+            f"Image(s) to video: prompt='{prompt[:50]}...', "
+            f"images={len(image_urls)}, first={image_urls[0][:80] if image_urls else 'N/A'}"
         )
-        post_id = await self.create_image_post(token, image_url)
+
+        # Create media posts for ALL reference images
+        post_id = await self.create_image_posts(token, image_urls)
+
+        if not post_id:
+            raise UpstreamException("Failed to create media post for reference images")
+
         mode_map = {
             "fun": "--mode=extremely-crazy",
             "normal": "--mode=normal",
@@ -193,6 +245,7 @@ class VideoService:
                     "parentPostId": post_id,
                     "resolutionName": resolution,
                     "videoLength": video_length,
+                    "imageReferences": image_urls,
                 }
             }
         }
@@ -209,7 +262,10 @@ class VideoService:
                         tool_overrides={"videoGen": True},
                         model_config_override=model_config_override,
                     )
-                    logger.info(f"Video generation started: post_id={post_id}")
+                    logger.info(
+                        f"Video generation started: post_id={post_id}, "
+                        f"images={len(image_urls)}"
+                    )
                     async for line in stream_response:
                         yield line
             except Exception as e:
@@ -223,6 +279,28 @@ class VideoService:
                 raise UpstreamException(f"Video generation error: {str(e)}")
 
         return _stream()
+
+    # Keep backward compatibility: single image convenience method
+    async def generate_from_image(
+        self,
+        token: str,
+        prompt: str,
+        image_url: str,
+        aspect_ratio: str = "3:2",
+        video_length: int = 6,
+        resolution: str = "480p",
+        preset: str = "normal",
+    ) -> AsyncGenerator[bytes, None]:
+        """Generate video from a single reference image (backward compat)."""
+        return await self.generate_from_images(
+            token=token,
+            prompt=prompt,
+            image_urls=[image_url],
+            aspect_ratio=aspect_ratio,
+            video_length=video_length,
+            resolution=resolution,
+            preset=preset,
+        )
 
     @staticmethod
     async def completions(
@@ -282,31 +360,46 @@ class VideoService:
             should_upscale = resolution == "720p" and pool_name == BASIC_POOL_NAME
 
             try:
-                # Handle image attachments.
-                image_url = None
+                # Handle image attachments — upload up to 3 reference images.
+                uploaded_image_urls: List[str] = []
                 if image_attachments:
+                    # Limit to max supported reference images
+                    images_to_upload = image_attachments[:_MAX_VIDEO_REFERENCE_IMAGES]
+                    if len(image_attachments) > _MAX_VIDEO_REFERENCE_IMAGES:
+                        logger.info(
+                            f"Video generation supports up to {_MAX_VIDEO_REFERENCE_IMAGES} "
+                            f"reference images; using the first {_MAX_VIDEO_REFERENCE_IMAGES} "
+                            f"out of {len(image_attachments)}."
+                        )
+
                     upload_service = UploadService()
                     try:
-                        if len(image_attachments) > 1:
-                            logger.info(
-                                "Video generation supports a single reference image; using the first one."
-                            )
-                        attach_data = image_attachments[0]
-                        _, file_uri = await upload_service.upload_file(
-                            attach_data, token
-                        )
-                        image_url = f"https://assets.grok.com/{file_uri}"
-                        logger.info(f"Image uploaded for video: {image_url}")
+                        for idx, attach_data in enumerate(images_to_upload):
+                            try:
+                                _, file_uri = await upload_service.upload_file(
+                                    attach_data, token
+                                )
+                                image_url = f"https://assets.grok.com/{file_uri}"
+                                uploaded_image_urls.append(image_url)
+                                logger.info(
+                                    f"Image {idx + 1}/{len(images_to_upload)} "
+                                    f"uploaded for video: {image_url}"
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    f"Failed to upload image {idx + 1}/"
+                                    f"{len(images_to_upload)} for video: {e}"
+                                )
                     finally:
                         await upload_service.close()
 
                 # Generate video.
                 service = VideoService()
-                if image_url:
-                    response = await service.generate_from_image(
+                if uploaded_image_urls:
+                    response = await service.generate_from_images(
                         token,
                         prompt,
-                        image_url,
+                        uploaded_image_urls,
                         aspect_ratio,
                         video_length,
                         resolution,
