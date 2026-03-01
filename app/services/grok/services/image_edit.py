@@ -8,7 +8,7 @@ import random
 import re
 import time
 from dataclasses import dataclass
-from typing import AsyncGenerator, AsyncIterable, List, Union, Any
+from typing import AsyncGenerator, AsyncIterable, List, Union, Any, Optional
 
 import orjson
 from curl_cffi.requests.errors import RequestsError
@@ -58,6 +58,7 @@ class ImageEditService:
         response_format: str,
         stream: bool,
         chat_format: bool = False,
+        aspect_ratio: Optional[str] = None,
     ) -> ImageEditResult:
         if len(images) > 3:
             logger.info(
@@ -100,6 +101,14 @@ class ImageEditService:
                         },
                     }
                 }
+
+                # Forward aspect_ratio to Grok backend so image edits
+                # respect the requested output format (e.g. 9:16 for vertical video)
+                if aspect_ratio:
+                    model_config_override["modelMap"]["imageEditModelConfig"][
+                        "aspectRatio"
+                    ] = aspect_ratio
+
                 if parent_post_id:
                     model_config_override["modelMap"]["imageEditModelConfig"][
                         "parentPostId"
