@@ -181,15 +181,20 @@ class ImageEditService:
         image_urls: List[str] = []
         upload_service = UploadService()
         try:
-            for image in images:
-                _, file_uri = await upload_service.upload_file(image, token)
-                if file_uri:
-                    if file_uri.startswith("http"):
-                        image_urls.append(file_uri)
-                    else:
-                        image_urls.append(
-                            f"https://assets.grok.com/{file_uri.lstrip('/')}"
-                        )
+            for idx, image in enumerate(images):
+                try:
+                    _, file_uri = await upload_service.upload_file(image, token)
+                    if file_uri:
+                        if file_uri.startswith("http"):
+                            image_urls.append(file_uri)
+                        else:
+                            image_urls.append(
+                                f"https://assets.grok.com/{file_uri.lstrip('/')}"
+                            )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to upload image {idx + 1}/{len(images)}: {e}"
+                    )
         finally:
             await upload_service.close()
 
@@ -203,27 +208,44 @@ class ImageEditService:
         return image_urls
 
     async def _get_parent_post_id(self, token: str, image_urls: List[str]) -> str:
+        """Create media posts for ALL uploaded images and return the first post ID.
+
+        The Grok backend requires every image referenced in `imageReferences`
+        to have a corresponding media post.  Previously only the first URL was
+        used, which caused failures when editing with 2+ images.
+        """
         parent_post_id = None
-        try:
-            media_service = VideoService()
-            parent_post_id = await media_service.create_image_post(token, image_urls[0])
-            logger.debug(f"Parent post ID: {parent_post_id}")
-        except Exception as e:
-            logger.warning(f"Create image post failed: {e}")
+        media_service = VideoService()
+
+        for idx, url in enumerate(image_urls):
+            try:
+                post_id = await media_service.create_image_post(token, url)
+                logger.debug(
+                    f"Created image post {idx + 1}/{len(image_urls)}: {post_id}"
+                )
+                # Use the first successfully created post ID as parentPostId
+                if not parent_post_id:
+                    parent_post_id = post_id
+            except Exception as e:
+                logger.warning(
+                    f"Create image post failed for image {idx + 1}/{len(image_urls)} "
+                    f"({url[:80]}): {e}"
+                )
 
         if parent_post_id:
             return parent_post_id
 
+        # Fallback: try to extract post ID from the URL pattern
         for url in image_urls:
             match = re.search(r"/generated/([a-f0-9-]+)/", url)
             if match:
                 parent_post_id = match.group(1)
-                logger.debug(f"Parent post ID: {parent_post_id}")
+                logger.debug(f"Parent post ID (from URL): {parent_post_id}")
                 break
             match = re.search(r"/users/[^/]+/([a-f0-9-]+)/content", url)
             if match:
                 parent_post_id = match.group(1)
-                logger.debug(f"Parent post ID: {parent_post_id}")
+                logger.debug(f"Parent post ID (from URL): {parent_post_id}")
                 break
 
         return parent_post_id or ""
