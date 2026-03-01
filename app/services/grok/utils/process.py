@@ -39,8 +39,15 @@ def _normalize_line(line: Any) -> Optional[str]:
     return text
 
 
+# Fields in grok modelResponse that contain image URL arrays/strings.
+_IMAGE_URL_KEYS = {"generatedImageUrls", "imageUrls", "imageURLs", "imageEditUris"}
+
+
 def _collect_images(obj: Any) -> List[str]:
-    """递归收集响应中的图片 URL"""
+    """递归收集响应中的图片 URL。
+
+    Checks: generatedImageUrls, imageUrls, imageURLs, imageEditUris.
+    """
     urls: List[str] = []
     seen = set()
 
@@ -53,7 +60,7 @@ def _collect_images(obj: Any) -> List[str]:
     def walk(value: Any):
         if isinstance(value, dict):
             for key, item in value.items():
-                if key in {"generatedImageUrls", "imageUrls", "imageURLs"}:
+                if key in _IMAGE_URL_KEYS:
                     if isinstance(item, list):
                         for url in item:
                             if isinstance(url, str):
