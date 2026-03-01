@@ -43,18 +43,6 @@ class ImageEditResult:
     data: Union[AsyncGenerator[str, None], List[str]]
 
 
-def _extract_effective_aspect_ratio(model_config_override: dict) -> Optional[str]:
-    """Best-effort extraction of image edit aspect ratio from model override payload."""
-    try:
-        return (
-            model_config_override.get("modelMap", {})
-            .get("imageEditModelConfig", {})
-            .get("aspectRatio")
-        )
-    except Exception:
-        return None
-
-
 class ImageEditService:
     """Image edit orchestration service."""
 
@@ -72,9 +60,6 @@ class ImageEditService:
         chat_format: bool = False,
         aspect_ratio: Optional[str] = None,
     ) -> ImageEditResult:
-        logger.info(
-            f"[aspect-ratio-trace] image_edit.enter model={(model_info.model_id if model_info else 'unknown')} n={n} images={len(images)} stream={stream} response_format={response_format} requested_aspect_ratio={aspect_ratio}"
-        )
 
         if len(images) > 3:
             logger.info(
@@ -132,17 +117,7 @@ class ImageEditService:
 
                 tool_overrides = {"imageGen": True}
 
-                effective_aspect_ratio = _extract_effective_aspect_ratio(
-                    model_config_override
-                )
-                logger.info(
-                    f"[aspect-ratio-trace] image_edit.override model={(model_info.model_id if model_info else 'unknown')} image_refs={len(image_urls)} parent_post={bool(parent_post_id)} effective_aspect_ratio={effective_aspect_ratio}"
-                )
-
                 if stream:
-                    logger.info(
-                        f"[aspect-ratio-trace] image_edit.chat_call stream=True effective_aspect_ratio={effective_aspect_ratio}"
-                    )
                     response = await GrokChatService().chat(
                         token=current_token,
                         message=prompt,
@@ -297,10 +272,6 @@ class ImageEditService:
         model_config_override: dict,
     ) -> List[str]:
         calls_needed = (n + 1) // 2
-        effective_aspect_ratio = _extract_effective_aspect_ratio(model_config_override)
-        logger.info(
-            f"[aspect-ratio-trace] image_edit.collect model={(model_info.model_id if model_info else 'unknown')} calls_needed={calls_needed} requested_n={n} effective_aspect_ratio={effective_aspect_ratio}"
-        )
 
         async def _call_edit():
             response = await GrokChatService().chat(
