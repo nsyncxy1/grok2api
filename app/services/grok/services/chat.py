@@ -38,6 +38,25 @@ from app.services.token import get_token_manager, EffortType
 
 _CHAT_SEMAPHORE = None
 _CHAT_SEM_VALUE = None
+_NO_THINK_TAG_MODELS = {"grok-4.20-beta"}
+
+
+def _should_show_think(model: str, reasoning_effort: str | None) -> bool:
+    """Whether the API should expose <think></think> tags for the given model."""
+    if model in _NO_THINK_TAG_MODELS:
+        return False
+    if reasoning_effort is None:
+        return get_config("app.thinking")
+    return reasoning_effort != "none"
+
+
+def _strip_think_tags(content: str) -> str:
+    """Remove think tags while keeping their inner content."""
+    if not content:
+        return content
+    content = re.sub(r"<think>\s*", "", content, flags=re.IGNORECASE)
+    content = re.sub(r"\s*</think>", "", content, flags=re.IGNORECASE)
+    return content
 
 
 def extract_tool_text(raw: str, rollout_id: str = "") -> str:
@@ -403,10 +422,7 @@ class ChatService:
         await token_mgr.reload_if_stale()
 
         # 解析参数
-        if reasoning_effort is None:
-            show_think = get_config("app.thinking")
-        else:
-            show_think = reasoning_effort != "none"
+        show_think = _should_show_think(model, reasoning_effort)
         is_stream = stream if stream is not None else get_config("app.stream")
 
         # 跨 Token 重试循环
@@ -897,10 +913,16 @@ class CollectProcessor(proc_base.BaseProcessor):
 
     def _filter_content(self, content: str) -> str:
         """Filter special tags in content."""
-        if not content or not self.filter_tags:
+        if not content:
             return content
 
         result = content
+        if self.model in _NO_THINK_TAG_MODELS:
+            result = _strip_think_tags(result)
+
+        if not self.filter_tags:
+            return result
+
         if "xai:tool_usage_card" in self.filter_tags:
             rollout_id = ""
             rollout_match = re.search(
