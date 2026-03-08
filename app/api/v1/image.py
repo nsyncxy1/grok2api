@@ -429,7 +429,7 @@ def _is_upload_file(obj) -> bool:
     return hasattr(obj, "read") and hasattr(obj, "filename")
 
 
-@router.post("/images/generations")
+@router.post("/images/create")
 async def create_image(request: ImageGenerationRequest):
     """
     Image Generation API
@@ -509,7 +509,7 @@ async def create_image(request: ImageGenerationRequest):
     )
 
 
-@router.post("/images/edits")
+@router.post("/images/generations")
 async def edit_image(request: Request):
     """
     Image Edits API
@@ -568,7 +568,7 @@ async def edit_image(request: Request):
         stream = stream_str in ("true", "1", "yes")
 
     logger.info(
-        "[/v1/images/edits] model={} n={} size={} aspect_ratio={} response_format={} prompt_len={}",
+        "[/v1/images/generations] model={} n={} size={} aspect_ratio={} response_format={} prompt_len={}",
         model, n,
         size_raw or resolution_raw,
         aspect_ratio_raw,
@@ -588,7 +588,7 @@ async def edit_image(request: Request):
                     uploaded_files.append(v)
 
     logger.info(
-        "[/v1/images/edits] {} image(s): {}",
+        "[/v1/images/generations] {} image(s): {}",
         len(uploaded_files),
         [getattr(f, "filename", "?") for f in uploaded_files],
     )
@@ -709,7 +709,7 @@ async def edit_image(request: Request):
         )
 
     logger.info(
-        "[/v1/images/edits] final: size={} aspect_ratio={} (from_prompt={})",
+        "[/v1/images/generations] final: size={} aspect_ratio={} (from_prompt={})",
         normalized_size, aspect_ratio, extracted_from_prompt,
     )
 

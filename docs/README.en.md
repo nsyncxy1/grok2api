@@ -236,12 +236,12 @@ curl http://localhost:8000/v1/responses \
 
 <br>
 
-### `POST /v1/images/generations`
+### `POST /v1/images/create`
 
 > Image generation endpoint
 
 ```bash
-curl http://localhost:8000/v1/images/generations \
+curl http://localhost:8000/v1/images/create \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $GROK2API_API_KEY" \
   -d '{
@@ -278,12 +278,12 @@ curl http://localhost:8000/v1/images/generations \
 
 <br>
 
-### `POST /v1/images/edits`
+### `POST /v1/images/generations`
 
 > Image edit endpoint (multipart/form-data)
 
 ```bash
-curl http://localhost:8000/v1/images/edits \
+curl http://localhost:8000/v1/images/generations \
   -H "Authorization: Bearer $GROK2API_API_KEY" \
   -F "model=grok-imagine-1.0-edit" \
   -F "prompt=Make the image clearer" \
