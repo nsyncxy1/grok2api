@@ -528,6 +528,15 @@ async def edit_image(request: Request):
         request.headers.get("user-agent"),
     )
 
+    raw_body = await request.body()
+    body_preview = raw_body[:4096].decode("latin-1", errors="replace") if raw_body else ""
+    logger.info(
+        "[/v1/images/generations] raw body bytes={} preview={}{}",
+        len(raw_body) if raw_body is not None else 0,
+        body_preview,
+        "...(truncated)" if raw_body and len(raw_body) > 4096 else "",
+    )
+
     # ------------------------------------------------------------------
     # 1. 解析 multipart form data
     # ------------------------------------------------------------------
