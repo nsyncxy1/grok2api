@@ -521,13 +521,54 @@ async def edit_image(request: Request):
     - aspect_ratio / aspectRatio: 9:16, 16:9 ... (优先级高于 size)
     - size 也支持直接传比例字符串，例如 size=9:16
     """
+    logger.info(
+        "[/v1/images/generations] incoming request: content-type={} content-length={} user-agent={}",
+        request.headers.get("content-type"),
+        request.headers.get("content-length"),
+        request.headers.get("user-agent"),
+    )
+
     # ------------------------------------------------------------------
     # 1. 解析 multipart form data
     # ------------------------------------------------------------------
     form = await request.form()
 
+    form_keys = list(form.keys())
+    logger.info("[/v1/images/generations] parsed form keys: {}", form_keys)
+
+    form_debug = {}
+    for key in form_keys:
+        values = form.getlist(key)
+        normalized_values = []
+        for v in values:
+            if _is_upload_file(v):
+                normalized_values.append(
+                    {
+                        "type": type(v).__name__,
+                        "filename": getattr(v, "filename", None),
+                        "content_type": getattr(v, "content_type", None),
+                    }
+                )
+            else:
+                text = str(v)
+                normalized_values.append(
+                    {
+                        "type": type(v).__name__,
+                        "value": text if len(text) <= 200 else text[:200] + "...(truncated)",
+                        "length": len(text),
+                    }
+                )
+        form_debug[key] = normalized_values
+
+    logger.info("[/v1/images/generations] parsed form detail: {}", form_debug)
+
     # 提取文本字段（带默认值）
     prompt = form.get("prompt")
+    logger.info(
+        "[/v1/images/generations] raw prompt value: type={} value={!r}",
+        type(prompt).__name__ if prompt is not None else None,
+        str(prompt)[:500] if prompt is not None else None,
+    )
     if not prompt or not str(prompt).strip():
         raise ValidationException(
             message="Prompt is required",
@@ -568,11 +609,16 @@ async def edit_image(request: Request):
         stream = stream_str in ("true", "1", "yes")
 
     logger.info(
-        "[/v1/images/generations] model={} n={} size={} aspect_ratio={} response_format={} prompt_len={}",
-        model, n,
-        size_raw or resolution_raw,
+        "[/v1/images/generations] normalized fields: model={} n={} size={} resolution={} aspect_ratio={} response_format={} quality={} style={} stream={} prompt_len={}",
+        model,
+        n,
+        size_raw,
+        resolution_raw,
         aspect_ratio_raw,
         response_format_val,
+        quality,
+        style,
+        stream,
         len(prompt),
     )
 
@@ -588,9 +634,15 @@ async def edit_image(request: Request):
                     uploaded_files.append(v)
 
     logger.info(
-        "[/v1/images/generations] {} image(s): {}",
+        "[/v1/images/generations] {} recognized image(s): {}",
         len(uploaded_files),
-        [getattr(f, "filename", "?") for f in uploaded_files],
+        [
+            {
+                "filename": getattr(f, "filename", "?"),
+                "content_type": getattr(f, "content_type", None),
+            }
+            for f in uploaded_files
+        ],
     )
 
     # ------------------------------------------------------------------
@@ -651,6 +703,12 @@ async def edit_image(request: Request):
     for item in uploaded_files:
         content = await item.read()
         await item.close()
+        logger.info(
+            "[/v1/images/generations] reading upload: filename={} content_type={} bytes={}",
+            item.filename,
+            item.content_type,
+            len(content) if content else 0,
+        )
         if not content:
             raise ValidationException(
                 message="File content is empty",
