@@ -429,220 +429,31 @@ def _is_upload_file(obj) -> bool:
     return hasattr(obj, "read") and hasattr(obj, "filename")
 
 
-@router.post("/images/generations")
-async def create_image(request: ImageGenerationRequest):
-    """
-    Image Generation API
-
-    流式响应格式:
-    - event: image_generation.partial_image
-    - event: image_generation.completed
-
-    非流式响应格式:
-    - {"created": ..., "data": [{"b64_json": "..."}], "usage": {...}}
-    """
-    # stream 默认为 false
-    if request.stream is None:
-        request.stream = False
-
-    if request.response_format is None:
-        request.response_format = resolve_response_format(None)
-
-    # 参数验证
-    validate_generation_request(request)
-
-    # 兼容 base64/b64_json
-    if request.response_format == "base64":
-        request.response_format = "b64_json"
-
-    response_format = resolve_response_format(request.response_format)
-    response_field = response_field_name(response_format)
-
-    # compatibility: when caller sends only resolution, treat it as size.
-    normalize_size_input = request.size
-    if request.resolution and str(request.resolution).strip():
-        normalize_size_input = str(request.resolution).strip()
-
-    # Normalize size/aspect ratio (compat: accept aspectRatio and ratio-like size)
-    normalized_size, aspect_ratio = _normalize_size_and_aspect(
-        size=normalize_size_input,
-        aspect_ratio=request.aspect_ratio,
-    )
-
-    # 获取 token 和模型信息
-    token_mgr, token = await _get_token(request.model)
-    model_info = ModelService.get(request.model)
-
-    result = await ImageGenerationService().generate(
-        token_mgr=token_mgr,
-        token=token,
-        model_info=model_info,
-        prompt=request.prompt,
-        n=request.n,
-        response_format=response_format,
-        size=normalized_size,
-        aspect_ratio=aspect_ratio,
-        stream=bool(request.stream),
-    )
-
-    if result.stream:
-        return StreamingResponse(
-            result.data,
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-        )
-
-    data = [{response_field: img} for img in result.data]
-    usage = result.usage_override or {
-        "total_tokens": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "input_tokens_details": {"text_tokens": 0, "image_tokens": 0},
-    }
-
-    return JSONResponse(
-        content={
-            "created": int(time.time()),
-            "data": data,
-            "usage": usage,
-        }
-    )
+def _resolve_compat_edit_model(model: Optional[str]) -> str:
+    """Allow /images/generations callers to fall through into edit mode."""
+    model_val = (model or "").strip()
+    if not model_val or model_val == "grok-imagine-1.0":
+        return "grok-imagine-1.0-edit"
+    return model_val
 
 
-@router.post("/images/edits")
-async def edit_image(request: Request):
-    """
-    Image Edits API
+def _normalize_image_inputs(raw_image: Optional[Union[str, List[str]]]) -> List[str]:
+    if raw_image is None:
+        return []
+    if isinstance(raw_image, str):
+        return [raw_image] if raw_image.strip() else []
 
-    同官方 API 格式，仅支持 multipart/form-data 文件上传。
-    兼容 'image' 和 'image[]' 两种字段名，支持单图和多图上传。
+    images: List[str] = []
+    for item in raw_image:
+        if item is None:
+            continue
+        item_str = str(item).strip()
+        if item_str:
+            images.append(item_str)
+    return images
 
-    兼容额外字段:
-    - aspect_ratio / aspectRatio: 9:16, 16:9 ... (优先级高于 size)
-    - size 也支持直接传比例字符串，例如 size=9:16
-    """
-    # ------------------------------------------------------------------
-    # 1. 解析 multipart form data
-    # ------------------------------------------------------------------
-    form = await request.form()
 
-    # 提取文本字段（带默认值）
-    prompt = form.get("prompt")
-    if not prompt or not str(prompt).strip():
-        raise ValidationException(
-            message="Prompt is required",
-            param="prompt",
-            code="missing_prompt",
-        )
-    prompt = str(prompt).strip()
-
-    model = str(form.get("model", "grok-imagine-1.0-edit"))
-    n = int(form.get("n", 1))
-
-    size_raw = form.get("size")
-    resolution_raw = form.get("resolution")
-    effective_size_raw = size_raw if size_raw is not None else resolution_raw
-    has_size_field = effective_size_raw is not None
-    size = (
-        str(effective_size_raw).strip()
-        if effective_size_raw is not None
-        else "1024x1024"
-    )
-
-    # Compatibility: accept aspect_ratio/aspectRatio in multipart
-    aspect_ratio_raw = form.get("aspect_ratio")
-    if aspect_ratio_raw is None:
-        aspect_ratio_raw = form.get("aspectRatio")
-    aspect_ratio_val = str(aspect_ratio_raw).strip() if aspect_ratio_raw else None
-
-    quality = str(form.get("quality", "standard"))
-    response_format_raw = form.get("response_format")
-    response_format_val = str(response_format_raw) if response_format_raw else None
-    style_raw = form.get("style")
-    style = str(style_raw) if style_raw else None
-    stream_raw = form.get("stream")
-    if stream_raw is None:
-        stream = False
-    else:
-        stream_str = str(stream_raw).lower()
-        stream = stream_str in ("true", "1", "yes")
-
-    logger.info(
-        "[/v1/images/edits] model={} n={} size={} aspect_ratio={} response_format={} prompt_len={}",
-        model, n,
-        size_raw or resolution_raw,
-        aspect_ratio_raw,
-        response_format_val,
-        len(prompt),
-    )
-
-    # ------------------------------------------------------------------
-    # 提取上传的图片文件 —— 兼容多种字段名
-    # ------------------------------------------------------------------
-    uploaded_files = []
-    for key in form:
-        if key in _IMAGE_FIELD_NAMES:
-            values = form.getlist(key)
-            for v in values:
-                if _is_upload_file(v):
-                    uploaded_files.append(v)
-
-    logger.info(
-        "[/v1/images/edits] {} image(s): {}",
-        len(uploaded_files),
-        [getattr(f, "filename", "?") for f in uploaded_files],
-    )
-
-    # ------------------------------------------------------------------
-    # 2. 构建 Pydantic 请求对象进行校验
-    # ------------------------------------------------------------------
-    if response_format_val is None:
-        response_format_val = resolve_response_format(None)
-
-    try:
-        edit_request = ImageEditRequest(
-            prompt=prompt,
-            model=model,
-            n=n,
-            size=size,
-            resolution=str(resolution_raw).strip()
-            if resolution_raw is not None
-            else None,
-            aspect_ratio=aspect_ratio_val,
-            quality=quality,
-            response_format=response_format_val,
-            style=style,
-            stream=stream,
-        )
-    except ValidationError as exc:
-        errors = exc.errors()
-        if errors:
-            first = errors[0]
-            loc = first.get("loc", [])
-            msg = first.get("msg", "Invalid request")
-            code = first.get("type", "invalid_value")
-            param_parts = [
-                str(x) for x in loc if not (isinstance(x, int) or str(x).isdigit())
-            ]
-            param = ".".join(param_parts) if param_parts else None
-            raise ValidationException(message=msg, param=param, code=code)
-        raise ValidationException(message="Invalid request", code="invalid_value")
-
-    if edit_request.stream is None:
-        edit_request.stream = False
-
-    response_format = resolve_response_format(edit_request.response_format)
-    if response_format == "base64":
-        response_format = "b64_json"
-    edit_request.response_format = response_format
-    response_field = response_field_name(response_format)
-
-    # 参数验证
-    validate_edit_request(edit_request, uploaded_files)
-
-    # ------------------------------------------------------------------
-    # 3. 读取并验证图片内容
-    # ------------------------------------------------------------------
+async def _read_uploaded_images(uploaded_files) -> List[str]:
     max_image_bytes = 50 * 1024 * 1024
     allowed_types = {"image/png", "image/jpeg", "image/webp", "image/jpg"}
 
@@ -684,8 +495,60 @@ async def edit_image(request: Request):
         b64 = base64.b64encode(content).decode()
         images.append(f"data:{mime};base64,{b64}")
 
+    return images
+
+
+def _build_json_request_error(exc: ValidationError):
+    errors = exc.errors()
+    if errors:
+        first = errors[0]
+        loc = first.get("loc", [])
+        msg = first.get("msg", "Invalid request")
+        code = first.get("type", "invalid_value")
+        param_parts = [
+            str(x) for x in loc if not (isinstance(x, int) or str(x).isdigit())
+        ]
+        param = ".".join(param_parts) if param_parts else None
+        raise ValidationException(message=msg, param=param, code=code)
+    raise ValidationException(message="Invalid request", code="invalid_value")
+
+
+def _extract_uploaded_files(form) -> list:
+    uploaded_files = []
+    for key in form:
+        if key in _IMAGE_FIELD_NAMES:
+            values = form.getlist(key)
+            for v in values:
+                if _is_upload_file(v):
+                    uploaded_files.append(v)
+    return uploaded_files
+
+
+async def _execute_edit_request(
+    edit_request: ImageEditRequest,
+    *,
+    uploaded_files: Optional[list] = None,
+    inline_images: Optional[List[str]] = None,
+    has_size_field: bool = True,
+):
+    if edit_request.stream is None:
+        edit_request.stream = False
+
+    response_format = resolve_response_format(edit_request.response_format)
+    if response_format == "base64":
+        response_format = "b64_json"
+    edit_request.response_format = response_format
+    response_field = response_field_name(response_format)
+
+    images = list(inline_images or [])
+    if uploaded_files:
+        images = await _read_uploaded_images(uploaded_files)
+
+    # 参数验证
+    validate_edit_request(edit_request, images)
+
     # ------------------------------------------------------------------
-    # 4. 归一化比例（显式参数 > prompt 正则提取 > 默认 1:1）
+    # 归一化比例（显式参数 > prompt 正则提取 > 默认 1:1）
     # ------------------------------------------------------------------
     normalize_size_input = edit_request.size if has_size_field else None
     normalize_aspect_input = edit_request.aspect_ratio
@@ -709,13 +572,10 @@ async def edit_image(request: Request):
         )
 
     logger.info(
-        "[/v1/images/edits] final: size={} aspect_ratio={} (from_prompt={})",
+        "[images/edit] final: size={} aspect_ratio={} (from_prompt={})",
         normalized_size, aspect_ratio, extracted_from_prompt,
     )
 
-    # ------------------------------------------------------------------
-    # 5. 调用编辑服务
-    # ------------------------------------------------------------------
     token_mgr, token = await _get_token(edit_request.model)
     model_info = ModelService.get(edit_request.model)
 
@@ -751,6 +611,322 @@ async def edit_image(request: Request):
                 "input_tokens_details": {"text_tokens": 0, "image_tokens": 0},
             },
         }
+    )
+
+
+@router.post("/images/generations")
+async def create_image(request: Request):
+    """
+    Image Generation API
+
+    兼容行为：
+    - 传统 JSON 文生图：走 generations 逻辑
+    - 当调用 /v1/images/generations 时，如果请求里携带 image + prompt，
+      则自动切换为 edits 逻辑
+
+    流式响应格式:
+    - event: image_generation.partial_image
+    - event: image_generation.completed
+
+    非流式响应格式:
+    - {"created": ..., "data": [{"b64_json": "..."}], "usage": {...}}
+    """
+    content_type = (request.headers.get("content-type") or "").lower()
+
+    # multipart/form-data 且带 image 字段时，兼容走 edits 逻辑
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        uploaded_files = _extract_uploaded_files(form)
+        if uploaded_files:
+            prompt = form.get("prompt")
+            if not prompt or not str(prompt).strip():
+                raise ValidationException(
+                    message="Prompt is required",
+                    param="prompt",
+                    code="missing_prompt",
+                )
+
+            model = _resolve_compat_edit_model(form.get("model"))
+            n = int(form.get("n", 1))
+
+            size_raw = form.get("size")
+            resolution_raw = form.get("resolution")
+            effective_size_raw = size_raw if size_raw is not None else resolution_raw
+            has_size_field = effective_size_raw is not None
+            size = (
+                str(effective_size_raw).strip()
+                if effective_size_raw is not None
+                else "1024x1024"
+            )
+
+            aspect_ratio_raw = form.get("aspect_ratio")
+            if aspect_ratio_raw is None:
+                aspect_ratio_raw = form.get("aspectRatio")
+            aspect_ratio_val = (
+                str(aspect_ratio_raw).strip() if aspect_ratio_raw else None
+            )
+
+            response_format_raw = form.get("response_format")
+            response_format_val = (
+                str(response_format_raw)
+                if response_format_raw
+                else resolve_response_format(None)
+            )
+            style_raw = form.get("style")
+            style = str(style_raw) if style_raw else None
+            stream_raw = form.get("stream")
+            stream = False if stream_raw is None else str(stream_raw).lower() in (
+                "true",
+                "1",
+                "yes",
+            )
+
+            logger.info(
+                "[/v1/images/generations] detected image upload, delegating to edits: model={} n={} size={} aspect_ratio={} response_format={} files={}",
+                model,
+                n,
+                size_raw or resolution_raw,
+                aspect_ratio_raw,
+                response_format_val,
+                len(uploaded_files),
+            )
+
+            try:
+                edit_request = ImageEditRequest(
+                    prompt=str(prompt).strip(),
+                    model=model,
+                    n=n,
+                    size=size,
+                    resolution=str(resolution_raw).strip()
+                    if resolution_raw is not None
+                    else None,
+                    aspect_ratio=aspect_ratio_val,
+                    quality=str(form.get("quality", "standard")),
+                    response_format=response_format_val,
+                    style=style,
+                    stream=stream,
+                )
+            except ValidationError as exc:
+                _build_json_request_error(exc)
+
+            return await _execute_edit_request(
+                edit_request,
+                uploaded_files=uploaded_files,
+                has_size_field=has_size_field,
+            )
+
+    # JSON body：如果带 image 字段，也兼容走 edits 逻辑
+    try:
+        payload = await request.json()
+    except Exception:
+        raise ValidationException(
+            message="Request body must be valid JSON or multipart/form-data",
+            code="invalid_request",
+        )
+
+    if not isinstance(payload, dict):
+        raise ValidationException(
+            message="Request body must be a JSON object",
+            code="invalid_request",
+        )
+
+    raw_images = payload.get("image")
+    inline_images = _normalize_image_inputs(raw_images)
+    if inline_images:
+        compat_payload = dict(payload)
+        compat_payload["model"] = _resolve_compat_edit_model(payload.get("model"))
+        if compat_payload.get("response_format") is None:
+            compat_payload["response_format"] = resolve_response_format(None)
+
+        logger.info(
+            "[/v1/images/generations] detected inline image payload, delegating to edits: model={} image_count={}",
+            compat_payload.get("model"),
+            len(inline_images),
+        )
+
+        try:
+            edit_request = ImageEditRequest(**compat_payload)
+        except ValidationError as exc:
+            _build_json_request_error(exc)
+
+        has_size_field = (
+            payload.get("size") is not None or payload.get("resolution") is not None
+        )
+        return await _execute_edit_request(
+            edit_request,
+            inline_images=inline_images,
+            has_size_field=has_size_field,
+        )
+
+    try:
+        generation_request = ImageGenerationRequest(**payload)
+    except ValidationError as exc:
+        _build_json_request_error(exc)
+
+    # stream 默认为 false
+    if generation_request.stream is None:
+        generation_request.stream = False
+
+    if generation_request.response_format is None:
+        generation_request.response_format = resolve_response_format(None)
+
+    # 参数验证
+    validate_generation_request(generation_request)
+
+    # 兼容 base64/b64_json
+    if generation_request.response_format == "base64":
+        generation_request.response_format = "b64_json"
+
+    response_format = resolve_response_format(generation_request.response_format)
+    response_field = response_field_name(response_format)
+
+    # compatibility: when caller sends only resolution, treat it as size.
+    normalize_size_input = generation_request.size
+    if generation_request.resolution and str(generation_request.resolution).strip():
+        normalize_size_input = str(generation_request.resolution).strip()
+
+    # Normalize size/aspect ratio (compat: accept aspectRatio and ratio-like size)
+    normalized_size, aspect_ratio = _normalize_size_and_aspect(
+        size=normalize_size_input,
+        aspect_ratio=generation_request.aspect_ratio,
+    )
+
+    # 获取 token 和模型信息
+    token_mgr, token = await _get_token(generation_request.model)
+    model_info = ModelService.get(generation_request.model)
+
+    result = await ImageGenerationService().generate(
+        token_mgr=token_mgr,
+        token=token,
+        model_info=model_info,
+        prompt=generation_request.prompt,
+        n=generation_request.n,
+        response_format=response_format,
+        size=normalized_size,
+        aspect_ratio=aspect_ratio,
+        stream=bool(generation_request.stream),
+    )
+
+    if result.stream:
+        return StreamingResponse(
+            result.data,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    data = [{response_field: img} for img in result.data]
+    usage = result.usage_override or {
+        "total_tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "input_tokens_details": {"text_tokens": 0, "image_tokens": 0},
+    }
+
+    return JSONResponse(
+        content={
+            "created": int(time.time()),
+            "data": data,
+            "usage": usage,
+        }
+    )
+
+
+@router.post("/images/edits")
+async def edit_image(request: Request):
+    """
+    Image Edits API
+
+    同官方 API 格式，仅支持 multipart/form-data 文件上传。
+    兼容 'image' 和 'image[]' 两种字段名，支持单图和多图上传。
+
+    兼容额外字段:
+    - aspect_ratio / aspectRatio: 9:16, 16:9 ... (优先级高于 size)
+    - size 也支持直接传比例字符串，例如 size=9:16
+    """
+    form = await request.form()
+
+    prompt = form.get("prompt")
+    if not prompt or not str(prompt).strip():
+        raise ValidationException(
+            message="Prompt is required",
+            param="prompt",
+            code="missing_prompt",
+        )
+    prompt = str(prompt).strip()
+
+    model = str(form.get("model", "grok-imagine-1.0-edit"))
+    n = int(form.get("n", 1))
+
+    size_raw = form.get("size")
+    resolution_raw = form.get("resolution")
+    effective_size_raw = size_raw if size_raw is not None else resolution_raw
+    has_size_field = effective_size_raw is not None
+    size = (
+        str(effective_size_raw).strip()
+        if effective_size_raw is not None
+        else "1024x1024"
+    )
+
+    aspect_ratio_raw = form.get("aspect_ratio")
+    if aspect_ratio_raw is None:
+        aspect_ratio_raw = form.get("aspectRatio")
+    aspect_ratio_val = str(aspect_ratio_raw).strip() if aspect_ratio_raw else None
+
+    quality = str(form.get("quality", "standard"))
+    response_format_raw = form.get("response_format")
+    response_format_val = str(response_format_raw) if response_format_raw else None
+    style_raw = form.get("style")
+    style = str(style_raw) if style_raw else None
+    stream_raw = form.get("stream")
+    if stream_raw is None:
+        stream = False
+    else:
+        stream_str = str(stream_raw).lower()
+        stream = stream_str in ("true", "1", "yes")
+
+    logger.info(
+        "[/v1/images/edits] model={} n={} size={} aspect_ratio={} response_format={} prompt_len={}",
+        model,
+        n,
+        size_raw or resolution_raw,
+        aspect_ratio_raw,
+        response_format_val,
+        len(prompt),
+    )
+
+    uploaded_files = _extract_uploaded_files(form)
+
+    logger.info(
+        "[/v1/images/edits] {} image(s): {}",
+        len(uploaded_files),
+        [getattr(f, "filename", "?") for f in uploaded_files],
+    )
+
+    if response_format_val is None:
+        response_format_val = resolve_response_format(None)
+
+    try:
+        edit_request = ImageEditRequest(
+            prompt=prompt,
+            model=model,
+            n=n,
+            size=size,
+            resolution=str(resolution_raw).strip()
+            if resolution_raw is not None
+            else None,
+            aspect_ratio=aspect_ratio_val,
+            quality=quality,
+            response_format=response_format_val,
+            style=style,
+            stream=stream,
+        )
+    except ValidationError as exc:
+        _build_json_request_error(exc)
+
+    return await _execute_edit_request(
+        edit_request,
+        uploaded_files=uploaded_files,
+        has_size_field=has_size_field,
     )
 
 
